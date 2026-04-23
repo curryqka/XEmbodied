@@ -15,6 +15,16 @@
 
 </div>
 
+> **Authors:**
+>
+> Kangan Qian<sup>1,\*</sup>, ChuChu Xie<sup>1,2,\*</sup>, Yang Zhong<sup>2,\*</sup>, Jingrui Pang<sup>1</sup>, Siwen Jiao<sup>3</sup>, Sicong Jiang<sup>4</sup>, Zilin Huang<sup>5</sup>, Yunlong Wang<sup>1</sup>, Kun Jiang<sup>1,†</sup>, Mengmeng Yang<sup>1</sup>, Hao Ye<sup>2,†</sup>, Guanghao Zhang<sup>2</sup>, Hangjun Ye<sup>2</sup>, Guang Chen<sup>2</sup>, Long Chen<sup>2</sup>, Diange Yang<sup>1,†</sup>
+>
+> **Affiliations:**
+>
+> <sup>1</sup>Tsinghua University &nbsp; <sup>2</sup>Automotive and Robotics, Xiaomi Corporation &nbsp; <sup>3</sup>National University of Singapore &nbsp; <sup>4</sup>McGill University &nbsp; <sup>5</sup>University of Wisconsin–Madison
+>
+> \* Equal contribution &nbsp; † Corresponding author
+
 **XEmbodied: A Foundation Model with Enhanced Geometric and Physical Cues for Large-Scale Embodied Environments** ([arXiv 2604.18484](https://arxiv.org/abs/2604.18484)) 的官方开源实现。
 
 我们提出了 XEmbodied，一个面向自动驾驶与机器人 VQA 数据闭环系统的云端基础模型。XEmbodied 通过联合增强领域语义与三维理解能力，同时保持通用能力，实现了大规模场景挖掘与标注的鲁棒性。核心设计包括 **3D Adapter (3DA)**——一种几何连接器，通过专用 3D 令牌将三维基础模型的表征注入多模态大语言模型；不同于简单附加深度或点云的辅助输入方式，3DA 显式对齐三维结构与语言推理，赋予模型内生的三维感知能力。我们进一步提出 **Efficient Image-Embodied Adapter (EIEA)**，将原始工具输出蒸馏为紧凑的令牌摘要并无缝回注到 MLLM 上下文中，规避了 LLM 的可解释性负担。
