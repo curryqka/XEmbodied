@@ -17,13 +17,13 @@
 
 > **Authors:**
 >
-> Kangan Qian<sup>1,\*</sup>, ChuChu Xie<sup>1,2,\*</sup>, Yang Zhong<sup>2,\*</sup>, Jingrui Pang<sup>1</sup>, Siwen Jiao<sup>3</sup>, Sicong Jiang<sup>4</sup>, Zilin Huang<sup>5</sup>, Yunlong Wang<sup>1</sup>, Kun Jiang<sup>1,†</sup>, Mengmeng Yang<sup>1</sup>, Hao Ye<sup>2,†</sup>, Guanghao Zhang<sup>2</sup>, Hangjun Ye<sup>2</sup>, Guang Chen<sup>2</sup>, Long Chen<sup>2</sup>, Diange Yang<sup>1,†</sup>
+> Kangan Qian<sup>✉,\*</sup>, ChuChu Xie<sup>\*</sup>, Yang Zhong<sup>\*</sup>, Jingrui Pang, Siwen Jiao, Sicong Jiang, Zilin Huang, Yunlong Wang, Kun Jiang<sup>†</sup>, Mengmeng Yang, Hao Ye<sup>†</sup>, Guanghao Zhang, Hangjun Ye, Guang Chen, Long Chen, Diange Yang<sup>†</sup>
 >
 > **Affiliations:**
 >
-> <sup>1</sup>Tsinghua University &nbsp; <sup>2</sup>Automotive and Robotics, Xiaomi Corporation &nbsp; <sup>3</sup>National University of Singapore &nbsp; <sup>4</sup>McGill University &nbsp; <sup>5</sup>University of Wisconsin–Madison
+> Tsinghua University &nbsp; Automotive and Robotics, Xiaomi Corporation &nbsp; National University of Singapore &nbsp; McGill University &nbsp; University of Wisconsin–Madison
 >
-> \* Equal contribution &nbsp; † Corresponding author
+> ✉ Project Leader &nbsp; \* Equal contribution &nbsp; † Corresponding author
 
 **XEmbodied: A Foundation Model with Enhanced Geometric and Physical Cues for Large-Scale Embodied Environments** ([arXiv 2604.18484](https://arxiv.org/abs/2604.18484)) 的官方开源实现。
 
