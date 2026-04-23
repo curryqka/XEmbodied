@@ -15,6 +15,16 @@
 
 </div>
 
+> **Authors:**
+>
+> Kangan Qian<sup>1,\*</sup>, ChuChu Xie<sup>1,2,\*</sup>, Yang Zhong<sup>2,\*</sup>, Jingrui Pang<sup>1</sup>, Siwen Jiao<sup>3</sup>, Sicong Jiang<sup>4</sup>, Zilin Huang<sup>5</sup>, Yunlong Wang<sup>1</sup>, Kun Jiang<sup>1,†</sup>, Mengmeng Yang<sup>1</sup>, Hao Ye<sup>2,†</sup>, Guanghao Zhang<sup>2</sup>, Hangjun Ye<sup>2</sup>, Guang Chen<sup>2</sup>, Long Chen<sup>2</sup>, Diange Yang<sup>1,†</sup>
+>
+> **Affiliations:**
+>
+> <sup>1</sup>Tsinghua University &nbsp; <sup>2</sup>Automotive and Robotics, Xiaomi Corporation &nbsp; <sup>3</sup>National University of Singapore &nbsp; <sup>4</sup>McGill University &nbsp; <sup>5</sup>University of Wisconsin–Madison
+>
+> \* Equal contribution &nbsp; † Corresponding author
+
 Official implementation of **XEmbodied: A Foundation Model with Enhanced Geometric and Physical Cues for Large-Scale Embodied Environments** ([arXiv 2604.18484](https://arxiv.org/abs/2604.18484)).
 
 We present XEmbodied, a cloud-side foundation model tailored for autonomous driving and robotics VQA within data closed-loop systems. XEmbodied achieves robust large-scale scenario mining and annotation by jointly enhancing domain semantics and 3D understanding while preserving general capabilities. Central to our design is a **3D Adapter (3DA)**, a geometric connector that injects representations from a 3D foundation model into the MLLM via dedicated 3D tokens. Unlike approaches that merely append depth or point clouds as auxiliary inputs, 3DA explicitly aligns 3D structure with language reasoning to endow endogenous 3D competence. We further propose an **Efficient Image-Embodied Adapter (EIEA)**, which distills raw embodied tool outputs into compact token summaries and seamlessly reinserts them into the MLLM context, circumventing the interpretability burden on LLMs.
