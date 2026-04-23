@@ -31,21 +31,21 @@ We present XEmbodied, a cloud-side foundation model tailored for autonomous driv
 ## Results
 
 ### Table 1: Spatial & 3D Understanding
-The best results among the listed models are **bolded** and the second-best is <u>underlined</u>.
+The best results among the listed models are **bolded**.
 
 | Model | Ego3DBench ACC | Ego3DBench RMSE | SURDS | VLADBench | STRIDE-QA |
 |---|---|---|---|---|---|
 | **Proprietary Models** | | | | | |
-| GPT-4o [67] | 52.70 | 19.20 | 13.31 | 56.00 | <u>14.70</u> |
+| GPT-4o [67] | 52.70 | 19.20 | 13.31 | 56.00 | 14.70 |
 | Gemini-1.5 [82] | 53.50 | 19.62 | 32.77 | 54.23 | - |
 | **Open-Source Models** | | | | | |
 | Qwen2.5-VL-7B [5] | 41.10 | 30.36 | 12.61 | 50.75 | 1.41 |
 | Qwen2.5-VL-32B [5] | 57.30 | 15.87 | 38.82 | 61.33 | 6.58 |
 | Qwen3-VL-A3B-30B [4] | 53.15 | 13.84 | 38.69 | 59.81 | 8.69 |
-| Qwen3-VL-32B [4] | **59.93** | 15.70 | <u>41.53</u> | <u>61.64</u> | 6.00 |
+| Qwen3-VL-32B [4] | **59.93** | 15.70 | 41.53 | 61.64 | 6.00 |
 | **Spatial Models** | | | | | |
 | UniVG-R1-7B [6] | 46.82 | 53.85 | 1.96 | 46.51 | 4.61 |
-| PR1-OCR-2B [101] | 38.88 | <u>11.60</u> | 13.81 | 44.65 | 8.18 |
+| PR1-OCR-2B [101] | 38.88 | 11.60 | 13.81 | 44.65 | 8.18 |
 | PR1-Detection-3B [101] | 36.74 | 62.61 | 33.84 | 56.08 | 4.35 |
 | PR1-Counting-2B [101] | 40.32 | 51.95 | 13.69 | 48.52 | 1.94 |
 | PR1-Grounding-2B [101] | 39.54 | 12.34 | 13.96 | 43.67 | 7.15 |
@@ -54,10 +54,10 @@ The best results among the listed models are **bolded** and the second-best is <
 | Cosmos-R1 [2] | 45.62 | 23.41 | 10.05 | 55.93 | 1.03 |
 | Mimo-Embodied [29] | 53.62 | 16.57 | 24.04 | 55.82 | 7.90 |
 | **Our Model** | | | | | |
-| XEmbodied (Best) | <u>55.28</u> | **9.25** | **83.83** | **68.61** | **27.76** |
+| XEmbodied (Best) | 55.28 | **9.25** | **83.83** | **68.61** | **27.76** |
 
 ### Table 2: Semantic & Reasoning
-The best results among the listed models are **bolded** and the second-best is <u>underlined</u>.
+The best results among the listed models are **bolded**.
 
 | Model | DriveBench | DriveLMM-o1 | MapLM-v2 | LingoQA | Omnidrive |
 |---|---|---|---|---|---|
@@ -76,30 +76,59 @@ The best results among the listed models are **bolded** and the second-best is <
 | PR1-Counting-2B [101] | 39.72 | 50.94 | 47.43 | 48.52 | 2.00 |
 | PR1-Grounding-2B [101] | 52.03 | 53.83 | 51.00 | 50.30 | 4.85 |
 | **Embodied Models** | | | | | |
-| DriveMM [36] | 44.50 | <u>65.91</u> | 52.18 | 37.70 | 1.10 |
+| DriveMM [36] | 44.50 | 65.91 | 52.18 | 37.70 | 1.10 |
 | Cosmos-R1 [2] | 35.80 | 54.66 | 55.33 | 52.70 | 1.23 |
-| Mimo-Embodied [29] | <u>52.95</u> | 40.31 | <u>65.23</u> | **68.60** | 4.90 |
+| Mimo-Embodied [29] | 52.95 | 40.31 | 65.23 | **68.60** | 4.90 |
 | **Our Model** | | | | | |
-| XEmbodied (Best) | **53.18** | **77.01** | **78.55** | <u>65.70</u> | **25.43** |
+| XEmbodied (Best) | **53.18** | **77.01** | **78.55** | 65.70 | **25.43** |
 
 ### Table 3: Embodied & Affordance
-The best results among the listed models are **bolded** and the second-best is <u>underlined</u>.
+The best results among the listed models are **bolded**.
 
 | Model | Affordance-2K | Robo-Afford | Cosmos-R1 | Embodied-R1 | RoboRefitBench | VABench-Point | Where2place |
 |---|---|---|---|---|---|---|---|
 | **Proprietary Models** | | | | | | | |
-| GPT-4o [67] | 2.70 | 3.80 | 67.40 | <u>0.35</u> | 13.40 | 0.40 | 0.44 |
+| GPT-4o [67] | 2.70 | 3.80 | 67.40 | 0.35 | 13.40 | 0.40 | 0.44 |
 | Gemini-1.5 [82] | 5.19 | 4.20 | 71.10 | - | 35.50 | 0.80 | 0.89 |
 | **Open-Source Models** | | | | | | | |
 | Qwen2.5-VL-7B [5] | 8.70 | 3.00 | 72.50 | 0.25 | 76.40 | 0.75 | 0.90 |
-| Qwen2.5-VL-32B [5] | <u>9.10</u> | 3.25 | 72.50 | 0.00 | 77.60 | 1.45 | 1.25 |
+| Qwen2.5-VL-32B [5] | 9.10 | 3.25 | 72.50 | 0.00 | 77.60 | 1.45 | 1.25 |
 | Qwen3-VL-A3B-30B [4] | 8.85 | 3.65 | 74.50 | 0.05 | **83.95** | 1.10 | 1.51 |
 | Qwen3-VL-32B [4] | 6.90 | 4.00 | 75.50 | 0.05 | 83.15 | 1.84 | 1.50 |
 | **Embodied Models** | | | | | | | |
 | Cosmos-R1 [2] | 6.63 | 1.95 | 72.00 | 0.05 | 34.75 | 0.35 | 0.45 |
-| Mimo-Embodied [29] | 8.85 | 3.25 | **81.00** | 0.00 | 78.35 | <u>1.85</u> | 1.25 |
+| Mimo-Embodied [29] | 8.85 | 3.25 | **81.00** | 0.00 | 78.35 | 1.85 | 1.25 |
 | **Our Model** | | | | | | | |
-| XEmbodied (Best) | **78.50** | **4.35** | <u>76.00</u> | **3.80** | <u>87.15</u> | **3.50** | **2.30** |
+| XEmbodied (Best) | **78.50** | **4.35** | 76.00 | **3.80** | 87.15 | **3.50** | **2.30** |
+
+## TODO
+
+- [x] Release model code
+- [x] Release model weights
+- [x] Release inference code
+- [ ] Release dataset download
+- [ ] Release evaluation code
+- [ ] Release training code
+
+## Finetuned Models
+
+| Model | Base Model | Weights |
+|-------|-----------|---------|
+| XEmbodied | Qwen3-VL-30B-A3B-Instruct | [Kaggle](https://www.kaggle.com/models/zhongyangtony/xembodied/) |
+
+## Datasets
+
+XEmbodied is trained on a diverse set of embodied and general VQA datasets:
+
+| Category | Datasets |
+|----------|----------|
+| Driving VQA | LingoQA, SURDS, MapLM, DriveVQA, DriveLMM-o1, Omnidrive |
+| General VQA | RefCOCO, Flickr, VQAv2, GQA |
+| Driving Perception | BDD100K |
+| Robotic Manipulation | RoboRefit, Cosmos-R1, RoboVQA |
+| 3D / Spatial | VLADBench, Visual Trace |
+| Affordance | Part Affordance |
+| Embodied Grounding | VSI-590K, SPAR-7M, OpenSpaces |
 
 ## Project Structure
 
@@ -132,7 +161,6 @@ BaseModel-open/
     │   ├── option_parser.py                 # Option parsing utilities
     │   ├── filter_think_format.py           # Think-tag filtering for R1-type models
     │   └── box_match.py                     # Box format regex matching
-    ├── agent_tools/                         # Agent tool-call data generation
     ├── eval_tools/                          # Evaluation aggregation scripts
     ├── vis/                                 # Result visualization
     ├── data_statistics/                     # Data statistics & filtering
