@@ -120,15 +120,13 @@ The best results among the listed models are **bolded**.
 
 XEmbodied is trained on a diverse set of embodied and general VQA datasets:
 
-| Category | Datasets |
-|----------|----------|
-| Driving VQA | LingoQA, SURDS, MapLM, DriveVQA, DriveLMM-o1, Omnidrive |
-| General VQA | RefCOCO, Flickr, VQAv2, GQA |
-| Driving Perception | BDD100K |
-| Robotic Manipulation | RoboRefit, Cosmos-R1, RoboVQA |
-| 3D / Spatial | VLADBench, Visual Trace |
-| Affordance | Part Affordance |
-| Embodied Grounding | VSI-590K, SPAR-7M, OpenSpaces |
+| Category               | Datasets                                                                 |
+|------------------------|--------------------------------------------------------------------------|
+| Driving VQA            | LingoQA, SURDS, MapLM, DriveVQA, DriveLMM-o1, Omnidrive, BDD100K         |
+| General VQA            | RefCOCO, Flickr, VQAv2, GQA                                              |
+| Robot Manipulation     | RoboRefit, Cosmos-R1, RoboVQA                                            |
+| 3D / Spatial Reasoning | Visual Trace, VSI-590K, SPAR-7M, OpenSpaces                             |
+| Embodied Affordance    | Part Affordance                                                          |
 
 ## Project Structure
 
