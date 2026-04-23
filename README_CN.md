@@ -122,13 +122,11 @@ XEmbodied 在多种具身与通用 VQA 数据集上训练：
 
 | 类别 | 数据集 |
 |------|--------|
-| 驾驶 VQA | LingoQA, SURDS, MapLM, DriveVQA, DriveLMM-o1, Omnidrive |
-| 通用 VQA | RefCOCO, Flickr, VQAv2, GQA |
-| 驾驶感知 | BDD100K |
+| 驾驶 VQA | LingoQA, SURDS, MapLM, DriveVQA, DriveLMM-o1, Omnidrive, BDD100K |
+| 通用 VQA | RefCOCO, Flickr, VQAv2, GQA|
 | 机器人操作 | RoboRefit, Cosmos-R1, RoboVQA |
-| 3D / 空间 | VLADBench, Visual Trace |
-| 可供性 | Part Affordance |
-| 具身定位 | VSI-590K, SPAR-7M, OpenSpaces |
+| 3D / 空间 | Visual Trace, VSI-590K, SPAR-7M, OpenSpaces |
+| 具身可交互性 | Part Affordance |
 
 ## 项目结构
 
