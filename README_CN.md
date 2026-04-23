@@ -17,7 +17,7 @@
 
 > **Authors:**
 >
-> Kangan Qian<sup>✉,\*</sup>, ChuChu Xie<sup>\*</sup>, Yang Zhong<sup>\*</sup>, Jingrui Pang, Siwen Jiao, Sicong Jiang, Zilin Huang, Yunlong Wang, Kun Jiang<sup>†</sup>, Mengmeng Yang, Hao Ye<sup>†</sup>, Guanghao Zhang, Hangjun Ye, Guang Chen, Long Chen, Diange Yang<sup>†</sup>
+> Kangan Qian<sup>✉,\*</sup>, ChuChu Xie<sup>\*</sup>, Yang Zhong<sup>\*</sup>, Jingrui Pang, Siwen Jiao, Sicong Jiang, Zilin Huang, Yunlong Wang, Kun Jiang<sup>†</sup>, Mengmeng Yang, Hao Ye✉,<sup>†</sup>, Guanghao Zhang, Hangjun Ye, Guang Chen, Long Chen, Diange Yang<sup>†</sup>
 >
 > **Affiliations:**
 >
