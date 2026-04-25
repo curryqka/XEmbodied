@@ -309,13 +309,11 @@ python infer_with_EIEA_3D.py
 如果本项目对您的研究有帮助，请引用：
 
 ```bibtex
-@misc{qian2026xembodiedfoundationmodelenhanced,
-      title={XEmbodied: A Foundation Model with Enhanced Geometric and Physical Cues for Large-Scale Embodied Environments},
-      author={Kangan Qian and ChuChu Xie and Yang Zhong and Jingrui Pang and Siwen Jiao and Sicong Jiang and Zilin Huang and Yunlong Wang and Kun Jiang and Mengmeng Yang and Hao Ye and Guanghao Zhang and Hangjun Ye and Guang Chen and Long Chen and Diange Yang},
-      year={2026},
-      eprint={2604.18484},
-      archivePrefix={arXiv},
-      primaryClass={cs.CV},
-      url={https://arxiv.org/abs/2604.18484},
+
+@article{qian2026xembodied,
+  title={XEmbodied: A Foundation Model with Enhanced Geometric and Physical Cues for Large-Scale Embodied Environments},
+  author={Qian, Kangan and Xie, ChuChu and Zhong, Yang and Pang, Jingrui and Jiao, Siwen and Jiang, Sicong and Huang, Zilin and Wang, Yunlong and Jiang, Kun and Yang, Mengmeng and others},
+  journal={arXiv preprint arXiv:2604.18484},
+  year={2026}
 }
 ```
