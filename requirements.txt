@@ -1,0 +1,9 @@
+transformers>=4.57.1
+torch>=2.5.0
+qwen-vl-utils>=0.0.14
+decord
+ms-swift
+accelerate
+flash-attn
+pillow
+numpy
