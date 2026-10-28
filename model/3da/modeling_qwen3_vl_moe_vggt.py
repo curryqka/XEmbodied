@@ -137,10 +137,15 @@ class VGGTSpatialEncoder(nn.Module):
             del self.vggt_model.track_head
             self.vggt_model.track_head = None
         
-        # 2. Clean up unused parameters (optional, further reduces VRAM)
-        for name, param in list(self.vggt_model.named_parameters()):
-            if any(head in name for head in ['camera_head', 'point_head', 'depth_head', 'track_head']):
-                delattr(self.vggt_model, name.split('.')[0])  # Remove entire head module
+        # 2. Clean up unused parameters (further reduces VRAM).
+        #    Note: heads are already removed via `del self.vggt_model.<head>` above;
+        #    this loop is a safety net for any leftover references.
+        _head_keys = ('camera_head', 'point_head', 'depth_head', 'track_head')
+        for name, _ in list(self.vggt_model.named_parameters()):
+            if any(k in name for k in _head_keys):
+                top = name.split('.')[0]
+                if top in ('camera_head', 'point_head', 'depth_head', 'track_head'):
+                    delattr(self.vggt_model, top)
 
     def _resolve_execution_device(self) -> torch.device:
         """
