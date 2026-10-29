@@ -5,17 +5,53 @@ import json
 import os
 import re
 import statistics
+import sys
 import time
+from pathlib import Path
 
 import numpy as np
 import torch
+import torch.nn as nn
 from PIL import Image
 
-from ssr_eiea_common import TOR, load_midi, load_visual_encoders, load_vlm
-from ssr.utils.prompt import insert_tor
-from train_box_adapter import BoxAdapter
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
-OUT = "/home/kaneqian/XEmbodied/results/eiea_box"
+from model.eiea.ssr_eiea_common import (
+    TOR, VLM_BASE, load_midi, load_visual_encoders, load_vlm,
+)
+from ssr.utils.prompt import insert_tor
+
+OUT = os.environ.get("EIEABOX_OUT", str(ROOT / "results" / "eiea_box"))
+
+
+class BoxAdapter(nn.Module):
+    """Cross-attention box adapter used by the rebuttal EIEA-lite (7B).
+
+    Copied here so this cost script is self-contained; the training version
+    lives in the private experiment tree.
+    """
+
+    def __init__(self, dim=3584, heads=8):
+        super().__init__()
+        self.class_emb = nn.Embedding(11, 16)
+        self.box_mlp = nn.Sequential(
+            nn.Linear(16 + 10, 512), nn.GELU(), nn.Linear(512, dim))
+        self.cross = nn.MultiheadAttention(dim, heads, batch_first=True)
+        self.norm = nn.LayerNorm(dim)
+        self.alpha = nn.Parameter(torch.ones(1))
+
+    def forward(self, cue, boxes):
+        cue_n = cue / (cue.norm() + 1e-6)
+        if boxes.shape[0] > 0:
+            tok = self.box_mlp(torch.cat([self.class_emb(boxes[:, 0].long()),
+                                          boxes[:, 1:11]], -1)).unsqueeze(0)
+            att = self.cross(cue_n.unsqueeze(0), tok, tok)[0].squeeze(0)
+            att = att / (att.norm() + 1e-6)
+        else:
+            att = torch.zeros_like(cue_n)
+        return cue_n + self.alpha * att
 TERSE = "\nRespond with only the final answer in <answer></answer>; do not explain."
 CONDS = ["no_cue", "text_cue", "eiea"]
 
@@ -58,8 +94,7 @@ def main():
     from qwen_vl_utils import process_vision_info
 
     vlm = load_vlm(dev); vlm.eval()
-    proc = AutoProcessor.from_pretrained(
-        os.environ.get("SSR_VLM_BASE", "/dev/shm/models/Qwen2.5-VL-7B-Instruct"))
+    proc = AutoProcessor.from_pretrained(VLM_BASE)
     proc.tokenizer.add_tokens(TOR, special_tokens=True)
     tid = proc.tokenizer.convert_tokens_to_ids(TOR)
     midi, mtok = load_midi(dev); midi.eval()

@@ -9,9 +9,11 @@ import time
 
 import torch
 
-sys.path.insert(0, "/home/kaneqian/XEmbodied/code/xembodied-code - AAAI/xembodied/EIEA/models")
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
 
-OUT = "/home/kaneqian/XEmbodied/results/eiea_box"
+OUT = os.environ.get("EIEABOX_OUT", os.path.join(ROOT, "results", "eiea_box"))
 TOR_STR = "<|endoftext|>"
 
 
@@ -20,10 +22,19 @@ def main():
     ap.add_argument("--limit", type=int, default=30)
     ap.add_argument("--max_tokens", type=int, default=32)
     ap.add_argument("--model_path", default="/dev/shm/models/xembodied-v0")
+    ap.add_argument("--cue", default=os.path.join(OUT, "cue_2048.pt"),
+                    help="10x2048 cue cache consumed by the register")
     args = ap.parse_args()
+    os.environ["XEMB_TOR_CACHE"] = args.cue
+    os.environ.setdefault("VGGT_REPO_DIR", os.path.join(ROOT, "model", "3da"))
+    if not os.path.exists(args.cue):
+        raise FileNotFoundError(
+            f"cue cache {args.cue!r} not found; pass --cue with a 10x2048 "
+            "tensor cache produced by training/evaluation")
     from swift.utils import import_external_file
     from swift.infer_engine import TransformersEngine, InferRequest, RequestConfig
-    import_external_file("/tmp/eiea_register_2048.py")
+    import_external_file(os.path.join(ROOT, "model", "eiea",
+                                      "qwen3_vl_vggt_register.py"))
     eng = TransformersEngine(model=args.model_path, model_type="qwen3_vl_moe_vggt",
                              torch_dtype="bfloat16", trust_remote_code=True,
                              device_map="auto", max_memory={0: "43GiB", 1: "43GiB"})

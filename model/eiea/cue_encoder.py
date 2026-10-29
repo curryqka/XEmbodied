@@ -1,214 +1,440 @@
+"""EIEA cue encoder: Mamba-2 interpreter + structured-cue encoders + projection.
+
+Reference implementation of the Efficient Image-Embodied Adapter described in
+the XEmbodied paper (Sec. 3 / Appendix B) and clarified in the rebuttal.
+
+Canonical sequence fed to the Mamba-2 interpreter (causal scan):
+
+    [ text tokens | image tokens | depth tokens | <PHY>
+      | box tokens | <MOD> | BEV-map tokens | (<MOD>; BEV-flow tokens)
+      | R_1 ... R_K ]
+
+``<PHY>``/``<MOD>`` are the paper supplement's learned modality markers (they
+can be disabled with ``use_modality_tokens=False``).  ``R_1 ... R_K`` are the
+K learnable latent reasoning queries.  They are placed
+**last** so that their causal hidden states have already seen the question and
+every available physical cue.  Only the hidden states at these K positions are
+kept; they are mapped to the VLM embedding space by :class:`CueProjector`:
+
+    Z_phy = Linear(GELU(Linear(RMSNorm(H_tor))))  in R^{K x d_VLM}
+
+The order follows the paper supplement (``[X_T; <PHY>; ...]``, text first) and
+the rebuttal Q&A (``[X_T; <PHY>; Z_map; <MOD>; Z_flow; <MOD>; Z_box; R_1..R_10]``,
+latent tokens last).  An earlier version of this file placed the latent
+queries *before* the text; that is wrong for a causal interpreter because the
+queries would never see the question.
+
+Missing cues are represented by *omitting their tokens*.  This is what the
+training-time random masking in :mod:`model.eiea.corruption` simulates, and it
+lets the interpreter degrade gracefully when a detection/map/depth source is
+unavailable.
 """
-EIEA cue encoder: Mamba-2 interpreter + structured input encoders + projection.
 
-Architecture (paper §3, "Efficient Image-Embodied Adapter"):
-  image (CLIP/SigLIP) ──┐
-  depth (SigLIP)      ──┤→ [proj → Mamba-2 → φ_R] → 10 × d_VLM cue tokens
-  3D boxes            ──┤
-  BEV grid            ──┘
-  question text       ──┘
+from __future__ import annotations
 
-The 10 cue tokens are injected at designated <TOR> positions in the frozen
-VLM's input embeddings via masked_scatter.
-
-Sub-modules:
-  MIDIBackbone       Mamba-2 sequential encoder (pretrained SSR checkpoint)
-  BoxEncoder         class embedding + MLP → box tokens
-  BEVEncoder         CNN → spatial tokens
-  CueProjector       d_mamba → d_VLM linear projection (3584 → 2048)
-"""
+import math
+from dataclasses import asdict, dataclass, field
+from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
 
 
-class MIDIBackbone(nn.Module):
-    """Mamba-2 sequential encoder.
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+@dataclass
+class EIEAConfig:
+    """Shape/architecture configuration for the public EIEA implementation.
 
-    Takes projected image/depth embeddings, optional structured-cue tokens,
-    and question text tokens; outputs hidden states at TOR positions.
-
-    This is a thin wrapper around a pretrained `MambaForCausalLM` checkpoint
-    (state-spaces/mamba-130m-hf). The image/depth/text projections are
-    fine-tuned during EIEA alignment training.
+    ``image_dim`` / ``depth_dim`` are the CLIP ViT-L and SigLIP-SO400M hidden
+    sizes used by the MIDI interpreter.  ``hidden_size`` is the Mamba-2 hidden
+    size (mamba-130m uses 768).  ``d_vlm`` is the downstream VLM word-embedding
+    size: 2048 for Qwen3-VL-30B-A3B and 3584 for the Qwen2.5-VL-7B proxy.
     """
 
-    def __init__(self, mamba_model, hidden_size: int = 768):
-        super().__init__()
-        self.mamba = mamba_model
-        self.hidden_size = hidden_size
-        self.image_proj = nn.Sequential(
-            nn.Linear(1024, hidden_size), nn.GELU(),
-            nn.Linear(hidden_size, hidden_size))
-        self.depth_proj = nn.Sequential(
-            nn.Linear(1152, hidden_size), nn.GELU(),
-            nn.Linear(hidden_size, hidden_size))
+    image_dim: int = 1024
+    depth_dim: int = 1152
+    hidden_size: int = 768
+    d_vlm: int = 2048
+    num_tor: int = 10
+    bev_channels: int = 5
+    flow_channels: int = 2
+    num_box_classes: int = 11
+    box_features: int = 10
+    max_boxes: int = 100
+    dropout: float = 0.0
+    # Paper Appendix B: the Mamba-2 body is frozen; only the input/output
+    # projections are fine-tuned.  Set False to train the body end-to-end.
+    freeze_mamba: bool = True
+    normalize_boxes: bool = True
+    # Paper supplement: a <PHY> start marker before the physical block and
+    # <MOD> separators between heterogeneous modalities.
+    use_modality_tokens: bool = True
 
-    def forward(self, image_embeds, depth_embeds, cue_tokens, text_ids,
-                tor_token_id: int):
-        """Args:
-            image_embeds: [1, N_img, d_clip]  CLIP last hidden states
-            depth_embeds: [1, N_dep, d_sig]   SigLIP last hidden states
-            cue_tokens:   [N_cue, hidden]     optional structured-cue tokens
-                                          (boxes / BEV / etc.; may be empty)
-            text_ids:     [1, L_text]         tokenised question (+ TOR markers)
-            tor_token_id: int                token id of <TOR> in text_ids
-
-        Returns:
-            hidden: [1, N_img + N_dep + N_cue + L_text, hidden]  full Mamba output
-            tor_hidden: [N_tor, hidden]  hidden states at <TOR> positions
-        """
-        ie = self.image_proj(image_embeds)
-        de = self.depth_proj(depth_embeds)
-        te = self.mamba.get_input_embeddings()(text_ids)
-        parts = [ie, de]
-        if cue_tokens is not None and cue_tokens.shape[0] > 0:
-            parts.append(cue_tokens.unsqueeze(0))
-        parts.append(te)
-        seq = torch.cat(parts, dim=1)
-        mask = torch.ones(1, seq.shape[1], dtype=torch.long, device=seq.device)
-        out = self.mamba(inputs_embeds=seq, attention_mask=mask,
-                         output_hidden_states=True)
-        hidden = out.hidden_states[-1]
-        tor_hidden = hidden[:, ie.size(1) + de.size(1):, :][:, text_ids.eq(0)[:, 0].cumsum(0) < 0]  # placeholder
-        # Extract TOR-position hidden states.
-        tor_start = ie.size(1) + de.size(1) + (cue_tokens.shape[0] if cue_tokens is not None and cue_tokens.shape[0] > 0 else 0)
-        tor_end = tor_start + (text_ids == tor_token_id).sum().item()
-        tor_hidden = hidden[:, tor_start:tor_end, :]
-        return hidden, tor_hidden
+    def to_dict(self) -> Dict:
+        return asdict(self)
 
 
+# Scales for the 10 numeric box features:
+# x, y, z, length, width, height, yaw, vx, vy, distance.
+BOX_FEATURE_SCALES: Tuple[float, ...] = (
+    50.0, 50.0, 10.0, 10.0, 10.0, 10.0, math.pi, 20.0, 20.0, 50.0,
+)
+
+
+# ---------------------------------------------------------------------------
+# Sub-encoders
+# ---------------------------------------------------------------------------
 class BoxEncoder(nn.Module):
-    """Encode 3D boxes into tokens for the Mamba sequence.
+    """Encode 3D boxes as one token per box.
 
-    Each box is [class_id, cx, cy, cz, length, width, height, yaw, vx, vy, dist].
+    Each box is ``[class_id, cx, cy, cz, length, width, height, yaw, vx, vy,
+    dist]`` in the ego frame (same layout produced by
+    ``experiments/build_eiea_data.py``).  Numeric features are divided by fixed
+    physical scales before the MLP so that metres, radians and m/s enter the
+    network on comparable ranges.  The paper specifies a capacity of
+    ``L_3D = 100`` box tokens per scene; ``max_boxes`` enforces that cap.
     """
 
-    def __init__(self, num_classes: int = 11, hidden_size: int = 768):
+    def __init__(self, cfg: EIEAConfig):
         super().__init__()
-        self.class_emb = nn.Embedding(num_classes, 16)
+        self.cfg = cfg
+        self.class_emb = nn.Embedding(cfg.num_box_classes, 16)
+        in_dim = 16 + cfg.box_features
         self.mlp = nn.Sequential(
-            nn.Linear(16 + 10, 512), nn.GELU(),
-            nn.Linear(512, hidden_size))
+            nn.Linear(in_dim, 512), nn.GELU(),
+            nn.Dropout(cfg.dropout),
+            nn.Linear(512, cfg.hidden_size),
+        )
+        scales = torch.tensor(BOX_FEATURE_SCALES[: cfg.box_features], dtype=torch.float32)
+        self.register_buffer("feature_scales", scales, persistent=False)
 
-    def forward(self, boxes: torch.Tensor) -> torch.Tensor:
+    def forward(self, boxes: Optional[torch.Tensor]) -> torch.Tensor:
         """Args:
-            boxes: [N, 11] float tensor (class_id + 10 numeric features)
+            boxes: ``[N, 1 + box_features]`` float tensor, or ``None``/empty.
         Returns:
-            tokens: [N, hidden_size]
+            ``[N, hidden_size]``; ``[0, hidden_size]`` when no box is present.
         """
-        if boxes.shape[0] == 0:
-            return torch.zeros(0, self.mlp[-1].out_features,
-                               device=boxes.device, dtype=boxes.dtype)
-        cls = self.class_emb(boxes[:, 0].long())
-        feats = boxes[:, 1:11]
-        return self.mlp(torch.cat([cls, feats], -1))
+        w = self.class_emb.weight
+        if boxes is None or boxes.numel() == 0:
+            return torch.zeros(0, self.cfg.hidden_size, device=w.device, dtype=w.dtype)
+
+        boxes = boxes[: self.cfg.max_boxes].to(device=w.device)
+        cls = boxes[:, 0].long().clamp(0, self.cfg.num_box_classes - 1)
+        feats = boxes[:, 1: 1 + self.cfg.box_features].to(dtype=w.dtype)
+        if feats.shape[1] < self.cfg.box_features:
+            pad = self.cfg.box_features - feats.shape[1]
+            feats = torch.cat([feats, feats.new_zeros(feats.shape[0], pad)], dim=1)
+        if self.cfg.normalize_boxes:
+            feats = feats / self.feature_scales.to(device=feats.device, dtype=feats.dtype)
+        tok = torch.cat([self.class_emb(cls), feats], dim=-1)
+        return self.mlp(tok)
 
 
 class BEVEncoder(nn.Module):
-    """Encode a BEV grid into spatial tokens for the Mamba sequence.
+    """Encode a BEV raster into spatial tokens.
 
-    Input is a multi-channel BEV raster (e.g., drivable area, lane, road
-    divider, ped crossing, walkway; or RGB point-cloud BEV).
+    The public paper encoder is DiffMap-style (768-d output, projected to the
+    shared Mamba width).  This compact CNN keeps the same interface and emits
+    ``tokens`` (default 64) spatial tokens, matching the 8x8 token grid used in
+    the EIEA documentation.
     """
 
-    def __init__(self, in_channels: int = 5, hidden_size: int = 768,
-                 grid_size: int = 200):
+    def __init__(self, cfg: EIEAConfig, in_channels: Optional[int] = None,
+                 tokens: int = 64):
         super().__init__()
+        self.cfg = cfg
+        self.in_channels = in_channels if in_channels is not None else cfg.bev_channels
+        self.tokens = tokens
+        side = int(math.sqrt(tokens))
+        if side * side != tokens:
+            raise ValueError("tokens must be a perfect square")
         self.conv = nn.Sequential(
-            nn.Conv2d(in_channels, 32, 3, stride=2, padding=1), nn.GELU(),
+            nn.Conv2d(self.in_channels, 32, 3, stride=2, padding=1), nn.GELU(),
             nn.Conv2d(32, 64, 3, stride=2, padding=1), nn.GELU(),
             nn.Conv2d(64, 128, 3, stride=2, padding=1), nn.GELU(),
-            nn.AdaptiveAvgPool2d((8, 8)))
-        self.proj = nn.Linear(128, hidden_size)
+            nn.AdaptiveAvgPool2d((side, side)),
+        )
+        self.proj = nn.Linear(128, cfg.hidden_size)
 
-    def forward(self, bev: torch.Tensor) -> torch.Tensor:
+    def forward(self, bev: Optional[torch.Tensor],
+                empty_if_zero: bool = True) -> torch.Tensor:
         """Args:
-            bev: [C, H, W] BEV raster
+            bev: ``[C, H, W]`` or ``[1, C, H, W]`` float raster.
         Returns:
-            tokens: [64, hidden_size]
+            ``[tokens, hidden_size]``; ``[0, hidden_size]`` when absent.
         """
-        f = self.conv(bev.unsqueeze(0))          # [1, 128, 8, 8]
-        f = f.flatten(2).transpose(1, 2)          # [1, 64, 128]
-        return self.proj(f).squeeze(0)            # [64, hidden_size]
+        empty = torch.zeros(0, self.cfg.hidden_size, device=self.conv[0].weight.device)
+        if bev is None:
+            return empty
+        if bev.dim() == 4:
+            if bev.shape[0] != 1:
+                raise ValueError("BEVEncoder expects a single raster")
+            bev = bev[0]
+        if bev.dim() != 3:
+            raise ValueError(f"BEV raster must be [C,H,W], got {tuple(bev.shape)}")
+        if bev.shape[0] != self.in_channels:
+            raise ValueError(
+                f"BEV channels {bev.shape[0]} != configured {self.in_channels}")
+        if empty_if_zero and float(bev.detach().abs().sum()) == 0.0:
+            return empty
+        bev = bev.to(device=self.conv[0].weight.device, dtype=self.conv[0].weight.dtype)
+        f = self.conv(bev.unsqueeze(0))                 # [1,128,s,s]
+        f = f.flatten(2).transpose(1, 2)                # [1,tokens,128]
+        return self.proj(f).squeeze(0)                  # [tokens,hidden]
+
+
+class FlowEncoder(BEVEncoder):
+    """BEV-flow encoder (paper's PriorMotion modality).
+
+    The public data pipeline does not ship flow rasters, so this module is
+    optional; it is included so the implementation covers the paper's three
+    physical modalities (map, flow, box) without changing the API.
+    """
+
+    def __init__(self, cfg: EIEAConfig, in_channels: Optional[int] = None,
+                 tokens: int = 64):
+        super().__init__(
+            cfg,
+            in_channels=in_channels if in_channels is not None else cfg.flow_channels,
+            tokens=tokens,
+        )
 
 
 class CueProjector(nn.Module):
-    """Project Mamba hidden states (d_mamba) to VLM embedding space (d_VLM).
+    """Map Mamba hidden states (d_mamba) to VLM word-embedding space (d_VLM)."""
 
-    Follows SSR's rationale-to-semantic design: RMSNorm → Linear → GELU → Linear.
-    """
-
-    def __init__(self, d_mamba: int = 768, d_vlm: int = 2048):
+    def __init__(self, d_mamba: int = 768, d_vlm: int = 2048,
+                 dropout: float = 0.0):
         super().__init__()
         self.rms = nn.RMSNorm(d_mamba, eps=1e-6)
         self.fc1 = nn.Linear(d_mamba, d_vlm)
         self.act = nn.GELU()
+        self.drop = nn.Dropout(dropout)
         self.fc2 = nn.Linear(d_vlm, d_vlm)
 
-    def forward(self, tor_hidden: torch.Tensor) -> torch.Tensor:
-        """Args:
-            tor_hidden: [N_tor, d_mamba]
-        Returns:
-            cue_tokens: [N_tor, d_VLM]
-        """
-        return self.fc2(self.act(self.fc1(self.rms(tor_hidden))))
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.fc2(self.drop(self.act(self.fc1(self.rms(x)))))
 
 
-class EIEACueEncoder(nn.Module):
-    """Full EIEA cue encoder: combines all sub-encoders into 10 cue tokens.
+class MIDIBackbone(nn.Module):
+    """Thin wrapper around the SSR MIDI Mamba-2 backbone.
 
-    Training: end-to-end with answer cross-entropy through a frozen VLM.
-    Inference: cue tokens are injected at <TOR> positions via masked_scatter.
+    ``mamba_model`` is a ``MambaForCausalLM`` (or any module exposing
+    ``get_input_embeddings`` and a causal ``forward(inputs_embeds=...)``).
+    The image/depth projections mirror SSR's MIDI so the public SSR-MIDI
+    checkpoint can initialise them; the Mamba body can be frozen per the paper.
     """
 
-    def __init__(self, mamba_model, num_classes: int = 11,
-                 bev_channels: int = 5, hidden_size: int = 768,
-                 d_vlm: int = 2048, num_tor: int = 10):
+    def __init__(self, mamba_model: nn.Module, cfg: EIEAConfig):
         super().__init__()
-        self.midi = MIDIBackbone(mamba_model, hidden_size)
-        self.box_enc = BoxEncoder(num_classes, hidden_size)
-        self.bev_enc = BEVEncoder(bev_channels, hidden_size)
-        self.proj = CueProjector(hidden_size, d_vlm)
-        self.num_tor = num_tor
-        self.d_vlm = d_vlm
-        self.hidden_size = hidden_size
-        self.queries = nn.Parameter(torch.randn(num_tor, hidden_size) * 0.02)
-        self.cross_attn = nn.MultiheadAttention(hidden_size, 8, batch_first=True)
+        self.mamba = mamba_model
+        self.cfg = cfg
+        self.image_proj = nn.Sequential(
+            nn.Linear(cfg.image_dim, cfg.hidden_size), nn.GELU(),
+            nn.Linear(cfg.hidden_size, cfg.hidden_size),
+        )
+        self.depth_proj = nn.Sequential(
+            nn.Linear(cfg.depth_dim, cfg.hidden_size), nn.GELU(),
+            nn.Linear(cfg.hidden_size, cfg.hidden_size),
+        )
+        if cfg.dropout:
+            self.image_proj.append(nn.Dropout(cfg.dropout))
+            self.depth_proj.append(nn.Dropout(cfg.dropout))
 
-    def forward(self, image_embeds, depth_embeds, boxes, bev, text_ids,
-                tor_token_id: int):
-        """Args:
-            image_embeds: [1, N_img, d_clip]
-            depth_embeds: [1, N_dep, d_sig]
-            boxes: [N, 11] or empty
-            bev: [C, H, W] or None
-            text_ids: [1, L_text] question token ids (without TOR markers)
-            tor_token_id: int
+    def text_embeds(self, text_ids: torch.Tensor) -> torch.Tensor:
+        return self.mamba.get_input_embeddings()(text_ids)
+
+
+# ---------------------------------------------------------------------------
+# Full encoder
+# ---------------------------------------------------------------------------
+class EIEACueEncoder(nn.Module):
+    """Full EIEA cue encoder producing ``[1, K, d_VLM]`` physical-cue tokens."""
+
+    def __init__(self, mamba_model: nn.Module, cfg: Optional[EIEAConfig] = None):
+        super().__init__()
+        self.cfg = cfg or EIEAConfig()
+        self.midi = MIDIBackbone(mamba_model, self.cfg)
+        self.box_enc = BoxEncoder(self.cfg)
+        self.bev_enc = BEVEncoder(self.cfg)
+        self.flow_enc = FlowEncoder(self.cfg)
+        self.proj = CueProjector(self.cfg.hidden_size, self.cfg.d_vlm,
+                                 dropout=self.cfg.dropout)
+        self.queries = nn.Parameter(
+            torch.randn(self.cfg.num_tor, self.cfg.hidden_size) * 0.02)
+        self.phy_token = nn.Parameter(
+            torch.randn(1, 1, self.cfg.hidden_size) * 0.02)
+        self.mod_token = nn.Parameter(
+            torch.randn(1, 1, self.cfg.hidden_size) * 0.02)
+        if self.cfg.freeze_mamba:
+            self.set_mamba_frozen(True)
+
+    # -- construction / persistence ----------------------------------------
+    @classmethod
+    def from_midi(cls, midi: nn.Module, cfg: Optional[EIEAConfig] = None,
+                  copy_weights: bool = True) -> "EIEACueEncoder":
+        """Build an encoder around a loaded SSR ``MIDI`` instance.
+
+        ``midi`` is the full SSR MIDI module (``midi.mamba``, ``midi.image_proj``,
+        ``midi.depth_proj``).  Only those three components are copied; the
+        teacher LLM and ``tor_proj`` (which target the 7B teacher width) are not
+        part of the public EIEA path.
+        """
+        enc = cls(midi.mamba, cfg)
+        if copy_weights:
+            with torch.no_grad():
+                src = midi.state_dict()
+                for name, dst in enc.midi.state_dict().items():
+                    if name in src and src[name].shape == dst.shape:
+                        dst.copy_(src[name])
+                # SSR-MIDI already ships a pretrained rationale-to-3584
+                # projector.  Reuse its two linear layers when the downstream
+                # width matches (the 7B proxy); the 30B path needs a 768->2048
+                # map instead, so only the compatible layers are copied.
+                tor_proj = getattr(midi, "tor_proj", None)
+                if tor_proj is not None and hasattr(tor_proj, "__getitem__"):
+                    try:
+                        lin1, lin2 = tor_proj[0], tor_proj[-1]
+                        if lin1.weight.shape == enc.proj.fc1.weight.shape:
+                            enc.proj.fc1.weight.copy_(lin1.weight)
+                            if lin1.bias is not None and enc.proj.fc1.bias is not None:
+                                enc.proj.fc1.bias.copy_(lin1.bias)
+                        if lin2.weight.shape == enc.proj.fc2.weight.shape:
+                            enc.proj.fc2.weight.copy_(lin2.weight)
+                            if lin2.bias is not None and enc.proj.fc2.bias is not None:
+                                enc.proj.fc2.bias.copy_(lin2.bias)
+                    except (IndexError, AttributeError):
+                        pass
+        return enc
+
+    def save_checkpoint(self, path: str, extra: Optional[Dict] = None) -> None:
+        payload = {
+            "format": "xembodied-eiea-cue-v1",
+            "config": self.cfg.to_dict(),
+            "state_dict": self.state_dict(),
+        }
+        if extra:
+            payload.update(extra)
+        torch.save(payload, path)
+
+    @classmethod
+    def from_checkpoint(cls, path: str, mamba_model: nn.Module,
+                        map_location: str = "cpu",
+                        strict: bool = True) -> Tuple["EIEACueEncoder", Dict]:
+        ck = torch.load(path, map_location=map_location, weights_only=False)
+        cfg = EIEAConfig(**ck["config"]) if "config" in ck else EIEAConfig()
+        enc = cls(mamba_model, cfg)
+        enc.load_state_dict(ck["state_dict"], strict=strict)
+        return enc, ck
+
+    # -- training controls -------------------------------------------------
+    def set_mamba_frozen(self, frozen: bool = True) -> None:
+        self._mamba_frozen = frozen
+        for p in self.midi.mamba.parameters():
+            p.requires_grad_(not frozen)
+
+    def train(self, mode: bool = True) -> "EIEACueEncoder":
+        super().train(mode)
+        if getattr(self, "_mamba_frozen", False):
+            self.midi.mamba.eval()
+        return self
+
+    def trainable_parameters(self) -> List[nn.Parameter]:
+        return [p for p in self.parameters() if p.requires_grad]
+
+    # -- forward -----------------------------------------------------------
+    def forward(
+        self,
+        image_embeds: Optional[torch.Tensor] = None,
+        depth_embeds: Optional[torch.Tensor] = None,
+        boxes: Optional[torch.Tensor] = None,
+        bev: Optional[torch.Tensor] = None,
+        flow: Optional[torch.Tensor] = None,
+        text_ids: Optional[torch.Tensor] = None,
+        return_aux: bool = False,
+    ):
+        """Encode one sample's cues.
+
+        Args:
+            image_embeds: ``[1, N_img, image_dim]`` CLIP features of the
+                camera view that feeds EIEA (normally the front view).
+            depth_embeds: ``[1, N_dep, depth_dim]`` SigLIP features of the
+                DepthPro map, or ``None`` when depth is missing.
+            boxes: ``[N, 11]`` ego-frame boxes, or ``None``/empty.
+            bev: ``[C, H, W]`` BEV raster, or ``None``.
+            flow: ``[C, H, W]`` BEV-flow raster, or ``None``.
+            text_ids: ``[1, L_text]`` question token ids for the Mamba
+                interpreter (no TOR markers; the K latent queries are added
+                internally).
+            return_aux: also return sequence metadata for debugging.
 
         Returns:
-            cue_tokens: [1, num_tor, d_VLM]
+            ``[1, K, d_vlm]`` cue tokens (and optionally an aux dict).
         """
-        ie = self.midi.image_proj(image_embeds)
-        de = self.midi.depth_proj(depth_embeds)
-        parts = [ie, de]
-        if boxes is not None and boxes.shape[0] > 0:
-            parts.append(self.box_enc(boxes).unsqueeze(0))
-        if bev is not None and bev.abs().sum() > 0:
-            parts.append(self.bev_enc(bev).unsqueeze(0))
-        te = self.midi.mamba.get_input_embeddings()(text_ids)
-        # Insert 10 learnable TOR queries at the end (before text tokens).
-        tor_q = self.queries.unsqueeze(0).to(te.dtype)
-        parts.append(tor_q)
-        parts.append(te)
+        device = self.queries.device
+        dtype = self.queries.dtype
+        parts: List[torch.Tensor] = []
+        present: Dict[str, bool] = {}
+
+        if text_ids is not None:
+            te = self.midi.text_embeds(text_ids.to(device)).to(dtype)
+            parts.append(te)
+            present["text"] = True
+        if image_embeds is not None:
+            parts.append(self.midi.image_proj(image_embeds.to(dtype)).to(dtype))
+            present["image"] = True
+        if depth_embeds is not None:
+            parts.append(self.midi.depth_proj(depth_embeds.to(dtype)).to(dtype))
+            present["depth"] = True
+        physical = []
+        if boxes is not None and boxes.numel() > 0:
+            bt = self.box_enc(boxes.to(device))
+            if bt.shape[0] > 0:
+                physical.append(("box", bt.unsqueeze(0).to(dtype)))
+                present["box"] = True
+        if bev is not None:
+            bv = self.bev_enc(bev.to(device))
+            if bv.shape[0] > 0:
+                physical.append(("bev", bv.unsqueeze(0).to(dtype)))
+                present["bev"] = True
+        if flow is not None:
+            fv = self.flow_enc(flow.to(device))
+            if fv.shape[0] > 0:
+                physical.append(("flow", fv.unsqueeze(0).to(dtype)))
+                present["flow"] = True
+
+        if physical and self.cfg.use_modality_tokens:
+            parts.append(self.phy_token.to(device=device, dtype=dtype))
+            for i, (_, tok) in enumerate(physical):
+                if i:
+                    parts.append(self.mod_token.to(device=device, dtype=dtype))
+                parts.append(tok)
+        else:
+            parts.extend(tok for _, tok in physical)
+
+        parts.append(self.queries.unsqueeze(0).to(device=device, dtype=dtype))
         seq = torch.cat(parts, dim=1)
         mask = torch.ones(1, seq.shape[1], dtype=torch.long, device=seq.device)
-        out = self.midi.mamba(inputs_embeds=seq, attention_mask=mask,
-                              output_hidden_states=True)
+        out = self.midi.mamba(
+            inputs_embeds=seq, attention_mask=mask, output_hidden_states=True)
         hidden = out.hidden_states[-1]
-        # Extract the 10 TOR query positions.
-        tor_start = ie.size(1) + de.size(1) + (boxes.shape[0] if boxes is not None and boxes.shape[0] > 0 else 0) + self.num_tor
-        tor_start = sum(p.shape[1] for p in parts[:-1])  # all except text
-        tor_hidden = hidden[:, tor_start:tor_start + self.num_tor, :]
-        cue = self.midi.tor_proj(tor_hidden.squeeze(0) if tor_hidden.dim() == 3 else tor_hidden)
-        return cue.unsqueeze(0)  # [1, num_tor, d_VLM]
+        # The K latent queries are the last K positions by construction.
+        tor_hidden = hidden[:, -self.cfg.num_tor:, :]
+        cue = self.proj(tor_hidden.squeeze(0)).unsqueeze(0)
+
+        if return_aux:
+            aux = {
+                "seq_len": int(seq.shape[1]),
+                "modalities": present,
+                "tor_hidden": tor_hidden,
+            }
+            return cue, aux
+        return cue
+
+
+__all__ = [
+    "EIEAConfig", "BoxEncoder", "BEVEncoder", "FlowEncoder",
+    "CueProjector", "MIDIBackbone", "EIEACueEncoder",
+]

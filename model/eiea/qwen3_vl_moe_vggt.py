@@ -25,7 +25,7 @@ from transformers.models.qwen2.modeling_qwen2 import Qwen2RMSNorm
 # Helpers
 # ==============================================================================
 
-_DEFAULT_VGGT_REPO_DIR = str(Path(__file__).resolve().parent.parent / "vggt")
+_DEFAULT_VGGT_REPO_DIR = str(Path(__file__).resolve().parent.parent / "3da")
 
 
 def _parse_torch_dtype(x: Optional[Union[str, torch.dtype]]) -> torch.dtype:
@@ -80,7 +80,7 @@ class VGGTSpatialEncoder(nn.Module):
         try:
             from vggt.models.vggt import VGGT
         except ImportError:
-            sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "3DA", "my_qwen3_vggt_xattnv2"))
+            sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "3da"))
             from vggt.models.vggt import VGGT
         self.vggt_model = VGGT(
             img_size=cfg.img_size, 
@@ -546,6 +546,7 @@ class Qwen3VLMoeVGGTForConditionalGeneration(Qwen3VLMoeForConditionalGeneration)
         # ===================== TOR new parameters =====================
         tor_embeds: Optional[torch.FloatTensor] = None,
         tor_token_id: int = None,
+        tor_positions: Optional[torch.Tensor] = None,
         **kwargs,
     ):
         # Backward-compatible aliases
@@ -559,15 +560,52 @@ class Qwen3VLMoeVGGTForConditionalGeneration(Qwen3VLMoeForConditionalGeneration)
             inputs_embeds = self.get_input_embeddings()(input_ids)
 
         # ===================== TOR embedding injection (core logic) =====================
-        if tor_embeds is not None and tor_token_id is not None:
-            mask = input_ids == tor_token_id
-            num_tokens = mask.sum().item()
-            if num_tokens > 0 and tor_embeds.shape[1] == num_tokens:
-                mask_unsqueezed = mask.unsqueeze(-1)
-                mask_expanded = mask_unsqueezed.expand_as(inputs_embeds)
-                tor_mask = mask_expanded.to(inputs_embeds.device)
-                tor_embeds = tor_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
-                inputs_embeds = inputs_embeds.masked_scatter(tor_mask, tor_embeds.squeeze(0))
+        # Injection must be loud on failure: silently skipping it makes an
+        # evaluation look like "the cue has no effect" when in fact the cue was
+        # never inserted.  During decoding (past_key_values is not None) there
+        # are no marker positions, so injection is intentionally skipped.
+        if tor_embeds is not None:
+            if input_ids is None:
+                raise ValueError("tor_embeds requires input_ids to locate TOR positions")
+            if tor_positions is None and tor_token_id is None:
+                raise ValueError(
+                    "tor_embeds was provided but neither tor_token_id nor "
+                    "tor_positions was given")
+            if tor_positions is not None:
+                mask = tor_positions.to(device=input_ids.device, dtype=torch.bool)
+                if mask.dim() == 1:
+                    mask = mask.unsqueeze(0)
+            else:
+                mask = input_ids == tor_token_id
+
+            if tor_embeds.dim() == 2:
+                tor_embeds = tor_embeds.unsqueeze(0)
+            if tor_embeds.dim() != 3:
+                raise ValueError(
+                    f"tor_embeds must be [K,D] or [B,K,D], got {tuple(tor_embeds.shape)}")
+
+            batch, seq_len = input_ids.shape
+            if tor_embeds.shape[0] != batch:
+                raise ValueError(
+                    f"tor_embeds batch {tor_embeds.shape[0]} != input batch {batch}")
+            counts = mask.sum(dim=1)
+            total = int(counts.sum())
+            if total == 0:
+                if past_key_values is None:
+                    raise ValueError(
+                        "tor_embeds was provided but the prompt contains no TOR "
+                        "positions; check the TOR marker/token id")
+                # decoding step: no prompt positions left to fill
+            else:
+                if not bool((counts == tor_embeds.shape[1]).all()):
+                    raise ValueError(
+                        f"TOR marker count per sample {counts.tolist()} != "
+                        f"tor_embeds length {tor_embeds.shape[1]}. The cue would "
+                        "not be injected; fix the prompt/marker or the encoder.")
+                src = tor_embeds.reshape(-1, tor_embeds.shape[-1])
+                src = src.to(inputs_embeds.device, inputs_embeds.dtype)
+                tor_mask = mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
+                inputs_embeds = inputs_embeds.masked_scatter(tor_mask, src)
 
         # Fix: initialize visual variables early to avoid undefined error
         visual_pos_masks = None
@@ -693,6 +731,7 @@ class Qwen3VLMoeVGGTForConditionalGeneration(Qwen3VLMoeForConditionalGeneration)
         # Critical: pass TOR parameters
         model_inputs["tor_embeds"] = kwargs.get("tor_embeds")
         model_inputs["tor_token_id"] = kwargs.get("tor_token_id")
+        model_inputs["tor_positions"] = kwargs.get("tor_positions")
         return model_inputs
 
 

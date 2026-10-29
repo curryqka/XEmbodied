@@ -8,21 +8,29 @@ wrong_scene.
 import json
 import os
 import random
+import sys
+from pathlib import Path
 
 import numpy as np
 import torch
 from PIL import Image
 
-from ssr_eiea_common import (
-    DEPTH_CKPT, TOR, depth_uint8, load_midi, load_visual_encoders, load_vlm,
-)
-from ssr.utils.prompt import insert_tor
-from e2_ssr_stress import extract_pred, score
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
-DATA = "/media/nas_users/kaneqian/data/XEmbodied"
-MANIFEST = os.path.join(DATA, "ssrbench_coco_manifest.json")
-IMAGES = os.path.join(DATA, "ssrbench_images")
-OUT = "/home/kaneqian/XEmbodied/results/plan1025"
+from model.eiea.ssr_eiea_common import (
+    DEPTH_CKPT, TOR, VLM_BASE, depth_uint8, load_midi, load_visual_encoders,
+    load_vlm,
+)
+from training.eiea_data import extract_answer, score_answer
+
+DATA = os.environ.get("SSR_DEPTH_DATA", "/media/nas_users/kaneqian/data/XEmbodied")
+MANIFEST = os.environ.get("SSR_DEPTH_MANIFEST",
+                          os.path.join(DATA, "ssrbench_coco_manifest.json"))
+IMAGES = os.environ.get("SSR_DEPTH_IMAGES",
+                        os.path.join(DATA, "ssrbench_images"))
+OUT = os.environ.get("SSR_DEPTH_OUT", str(ROOT / "results" / "plan1025"))
 VARIANTS = ["clean", "noise_20", "mask_50", "flat", "wrong_scene"]
 
 
@@ -49,6 +57,8 @@ def corrupt(depth, variant, rng, donor=None):
 
 
 def main():
+    os.makedirs(OUT, exist_ok=True)
+    torch.cuda.set_device(1)
     rows = json.load(open(MANIFEST))
     have = {f for f in os.listdir(IMAGES) if f.endswith(".jpg")}
     rows = [r for r in rows if r["image_path"].rsplit("/", 1)[1] in have]
@@ -107,8 +117,7 @@ def main():
     torch.cuda.empty_cache()
 
     vlm = load_vlm("cuda:1")
-    proc = AutoProcessor.from_pretrained(
-        os.environ.get("SSR_VLM_BASE", "/dev/shm/models/Qwen2.5-VL-7B-Instruct"))
+    proc = AutoProcessor.from_pretrained(VLM_BASE)
     proc.tokenizer.add_tokens(TOR, special_tokens=True)
     tid = proc.tokenizer.convert_tokens_to_ids(TOR)
 
@@ -132,10 +141,10 @@ def main():
                                    tor_embeds=cues[v][i].unsqueeze(0).to("cuda:1"),
                                    tor_token_id=tid)
             raw = proc.tokenizer.decode(out[0][kw["input_ids"].shape[1]:], skip_special_tokens=True)
-            pred = extract_pred(raw)
+            pred = extract_answer(raw)
             results[v].append({"qid": f"q{i}", "task": r["task"], "gt": r["answer"],
                                "pred": pred, "raw": raw,
-                               "ok": int(score(pred, r["answer"]))})
+                               "ok": int(score_answer(pred, r["answer"]))})
         acc = np.mean([p["ok"] for p in results[v]])
         changed = sum(a["raw"] != b["raw"] for a, b in zip(results["clean"], results[v]))
         print(f"{v:12s} acc={acc:.4f} changed={changed}/{len(rows)}", flush=True)

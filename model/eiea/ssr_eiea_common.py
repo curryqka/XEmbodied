@@ -11,28 +11,40 @@ import types
 import torch
 from transformers import AutoTokenizer, CLIPProcessor, CLIPVisionModel, SiglipProcessor, SiglipVisionModel
 
-SSR_ROOT = "/home/kaneqian/XEmbodied/code/SSR"
-if SSR_ROOT not in sys.path:
+_DEFAULT_SSR_ROOT = "/home/kaneqian/XEmbodied/code/SSR"
+SSR_ROOT = os.environ.get(
+    "SSR_ROOT", _DEFAULT_SSR_ROOT if os.path.isdir(_DEFAULT_SSR_ROOT) else "")
+if SSR_ROOT and SSR_ROOT not in sys.path:
     sys.path.insert(0, SSR_ROOT)
 
 # SSR modules call `import autoroot` purely for path setup; it fails outside a
 # pyrootutils project tree. A stub is enough for inference.
 sys.modules.setdefault("autoroot", types.ModuleType("autoroot"))
 
-MIDI_DIR = "/media/nas_users/kaneqian/model/ssr/SSR-MIDI-7B"
-MAMBA_DIR = "/media/nas_users/kaneqian/model/ssr/mamba-130m-hf"
-CLIP_DIR = "/media/nas_users/kaneqian/model/ssr/clip-vit-large-patch14"
-SIGLIP_DIR = "/media/nas_users/kaneqian/model/ssr/siglip-so400m-patch14-384"
+_SSR_MODELS = os.environ.get("SSR_MODEL_ROOT", "/media/nas_users/kaneqian/model/ssr")
+MIDI_DIR = os.environ.get("SSR_MIDI_DIR", os.path.join(_SSR_MODELS, "SSR-MIDI-7B"))
+MAMBA_DIR = os.environ.get("SSR_MAMBA_DIR", os.path.join(_SSR_MODELS, "mamba-130m-hf"))
+CLIP_DIR = os.environ.get("SSR_CLIP_DIR", os.path.join(_SSR_MODELS, "clip-vit-large-patch14"))
+SIGLIP_DIR = os.environ.get("SSR_SIGLIP_DIR", os.path.join(_SSR_MODELS, "siglip-so400m-patch14-384"))
 VLM_BASE = os.environ.get("SSR_VLM_BASE",
                           "/media/nas_users/kaneqian/model/Qwen2.5-VL-7B-Instruct")
-VLM_ADAPTER = "/media/nas_users/kaneqian/model/ssr/SSR-VLM-7B"
-DEPTH_CKPT = "/media/nas_users/kaneqian/model/ssr/DepthPro/depth_pro.pt"
+VLM_ADAPTER = os.environ.get("SSR_VLM_ADAPTER", os.path.join(_SSR_MODELS, "SSR-VLM-7B"))
+DEPTH_CKPT = os.environ.get("SSR_DEPTH_CKPT", os.path.join(_SSR_MODELS, "DepthPro/depth_pro.pt"))
 
 TOR = "<tor>"
 
 
+def _require_dir(path: str, what: str) -> None:
+    if not os.path.isdir(path):
+        raise FileNotFoundError(
+            f"{what} not found at {path!r}. Set the corresponding SSR_* "
+            "environment variable (see model/eiea/README.md).")
+
+
 def load_midi(device):
     """Load MIDI without the frozen Qwen2.5-7B teacher (only needed for training)."""
+    _require_dir(MIDI_DIR, "SSR-MIDI checkpoint")
+    _require_dir(MAMBA_DIR, "mamba-130m-hf checkpoint")
     import ssr.models.midi as midi_mod
     from ssr.models.midi import MIDI, MIDIConfig
     from ssr.utils.prompt import SSRSpecialToken
@@ -71,6 +83,8 @@ def load_midi(device):
 
 
 def load_visual_encoders(device):
+    _require_dir(CLIP_DIR, "CLIP ViT-L checkpoint")
+    _require_dir(SIGLIP_DIR, "SigLIP checkpoint")
     clip_proc = CLIPProcessor.from_pretrained(CLIP_DIR)
     clip = CLIPVisionModel.from_pretrained(CLIP_DIR, torch_dtype=torch.float32).to(device).eval()
     sig_proc = SiglipProcessor.from_pretrained(SIGLIP_DIR)
@@ -104,6 +118,8 @@ def depth_uint8(image_pil, dpro, dtf, device):
 
 
 def load_vlm(device):
+    _require_dir(VLM_BASE, "Qwen2.5-VL-7B base checkpoint")
+    _require_dir(VLM_ADAPTER, "SSR-VLM LoRA adapter")
     import json as _json
 
     from peft import LoraConfig, inject_adapter_in_model, set_peft_model_state_dict
@@ -132,4 +148,6 @@ def load_vlm(device):
     missing, unexpected = set_peft_model_state_dict(vlm, sd, adapter_name="default")
     print(f"adapter loaded: missing={len(missing)} unexpected={len(unexpected)}")
     vlm.eval()
+    for p in vlm.parameters():
+        p.requires_grad_(False)
     return vlm

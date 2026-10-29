@@ -1,160 +1,205 @@
 #!/usr/bin/env python3
-"""Train an EIEA-lite on top of SSR MIDI with box input.
+"""Train EIEA-lite on the 7B SSR proxy (box + BEV map + depth).
 
-Frozen: SSR-VLM (Qwen2.5-VL-7B + SSR LoRA), CLIP/SigLIP encoders.
-Trainable: MIDI (Mamba + projections) + a box encoder.
-Loss: answer cross-entropy through the frozen VLM with 10 cue tokens.
+This is the runnable counterpart of :mod:`training.train_eiea_30b`: the same
+cue encoder, corruption recipe and answer-CE objective, but the frozen
+backbone is SSR-VLM (Qwen2.5-VL-7B + SSR LoRA) and the cue width is 3584.
+It is intended for ablation / robustness checks on 2x4090-class hardware.
+
+Corruption is applied to the raw cue sources every step: whole-modality
+dropout, partial-cue dropping (keep only one of box/BEV/depth), box element
+drop / jitter, BEV block mask / noise, and depth noise / mask / flatten.
+
+Example:
+    python training/train_eiea_box.py \
+        --data results/eiea_box/train_bev.json \
+        --save results/eiea_box/eiea_7b_box_bev_depth.pt \
+        --steps 800 --corruption standard
 """
+from __future__ import annotations
+
 import argparse
-import json
 import os
-import re
+import random
+import sys
+import time
+from pathlib import Path
 
 import numpy as np
 import torch
-import torch.nn as nn
-from PIL import Image
 
-from ssr_eiea_common import (
-    DEPTH_CKPT, TOR, load_midi, load_visual_encoders, load_vlm,
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from model.eiea.corruption import CorruptionConfig, apply_corruption
+from model.eiea.cue_encoder import EIEAConfig, EIEACueEncoder
+from training.eiea_data import (
+    boxes_from_row, cap_processor_pixels, load_bev, load_depth, load_rows,
+    load_view_images, mamba_text_ids, prepare_vlm_batch,
 )
-from ssr.utils.prompt import insert_tor
 
-OUT = "/home/kaneqian/XEmbodied/results/eiea_box"
-NUM_BOX_FEATS = 10  # x,y,z,l,w,h,yaw,vx,vy,dist
+DEFAULT_TOR_STR = "<|endoftext|>"
 
 
-class BoxMIDI(nn.Module):
-    def __init__(self, midi, hidden=768):
-        super().__init__()
-        self.midi = midi
-        self.class_emb = nn.Embedding(11, 16)
-        self.box_mlp = nn.Sequential(
-            nn.Linear(16 + NUM_BOX_FEATS, hidden), nn.GELU(),
-            nn.Linear(hidden, hidden))
-
-    def forward(self, image_embeds, depth_embeds, boxes, ids, tor_id):
-        m = self.midi
-        ie = m.image_proj(image_embeds)
-        de = m.depth_proj(depth_embeds)
-        if boxes.shape[0] > 0:
-            be = self.box_mlp(torch.cat([self.class_emb(boxes[:, 0].long()),
-                                         boxes[:, 1:1 + NUM_BOX_FEATS]], -1))
-        else:
-            be = ie.new_zeros((0, ie.shape[-1]))
-        te = m.mamba.get_input_embeddings()(ids)
-        seq = torch.cat([ie, de, be.unsqueeze(0), te], 1)
-        mask = torch.ones(1, seq.shape[1], dtype=torch.long, device=seq.device)
-        out = m.mamba(inputs_embeds=seq, attention_mask=mask, output_hidden_states=True)
-        hidden = out.hidden_states[-1][:, ie.size(1) + de.size(1) + be.size(0):, :]
-        tor = m.tor_proj(hidden[(ids == tor_id)])
-        return tor
-
-
-def _messages(r, answer=None):
-    # front view only: boxes are in the ego frame, so the cue encoder carries
-    # the spatial evidence; this keeps training affordable on 2x4090.
-    content = [{"type": "image", "image": Image.open(r["images"][1]).convert("RGB").resize((256, 256))}]
-    content.append({"type": "text", "text": insert_tor("", 10) + "\n" + r["question"]})
-    msgs = [{"role": "user", "content": content}]
-    if answer is not None:
-        msgs.append({"role": "assistant", "content": answer})
-    return msgs
-
-
-def prepare_vlm_batch(proc, r, device, add_answer=None):
-    from qwen_vl_utils import process_vision_info
-    msgs = _messages(r, add_answer)
-    prompt = proc.apply_chat_template(msgs, tokenize=False,
-                                      add_generation_prompt=(add_answer is None))
-    imgs, _ = process_vision_info(msgs)
-    enc = proc(text=[prompt], images=imgs, videos=None, padding=True, return_tensors="pt")
-    kw = {k: v.to(device) for k, v in enc.items()
-          if k in ("input_ids", "attention_mask", "pixel_values", "image_grid_thw")}
-    return kw
-
-
-def answer_labels(proc, r, input_ids, device):
-    """Label the assistant answer: prefix = user turn + assistant header."""
-    from qwen_vl_utils import process_vision_info
-    msgs = _messages(r, None)
-    p = proc.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
-    imgs, _ = process_vision_info(msgs)
-    enc = proc(text=[p], images=imgs, videos=None, padding=True, return_tensors="pt")
-    n_prefix = enc["input_ids"].shape[1]
-    labels = torch.full_like(input_ids, -100)
-    labels[:, n_prefix:] = input_ids[:, n_prefix:]
-    return labels
+def parse_args():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--data", required=True)
+    ap.add_argument("--save", required=True)
+    ap.add_argument("--steps", type=int, default=800)
+    ap.add_argument("--lr", type=float, default=2e-4)
+    ap.add_argument("--lr_midi", type=float, default=2e-5)
+    ap.add_argument("--weight_decay", type=float, default=0.05)
+    ap.add_argument("--device", default="cuda:0")
+    ap.add_argument("--bev_channels", type=int, default=5)
+    ap.add_argument("--num_tor", type=int, default=10)
+    ap.add_argument("--hidden_size", type=int, default=768)
+    ap.add_argument("--d_vlm", type=int, default=3584)
+    ap.add_argument("--dropout", type=float, default=0.0)
+    ap.add_argument("--train_mamba", action="store_true")
+    ap.add_argument("--corruption", default="standard",
+                    choices=["none", "light", "standard", "heavy"])
+    ap.add_argument("--image_dropout", type=float, default=0.0,
+                    help="probability of replacing the VLM image with a gray "
+                         "frame, forcing the answer to rely on the cue tokens")
+    ap.add_argument("--tor_str", default=DEFAULT_TOR_STR)
+    ap.add_argument("--max_image_tokens", type=int, default=512)
+    ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--grad_accum", type=int, default=1)
+    ap.add_argument("--log_every", type=int, default=10)
+    ap.add_argument("--save_every", type=int, default=200)
+    ap.add_argument("--dry_run", action="store_true")
+    ap.add_argument("--smoke", type=int, default=0)
+    return ap.parse_args()
 
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--steps", type=int, default=1600)
-    ap.add_argument("--lr", type=float, default=1e-4)
-    ap.add_argument("--device", default="cuda:0")
-    ap.add_argument("--smoke", type=int, default=0)
-    ap.add_argument("--save", default=os.path.join(OUT, "encoder.pt"))
-    ap.add_argument("--data", default=os.path.join(OUT, "train.json"))
-    args = ap.parse_args()
+    args = parse_args()
+    if not torch.cuda.is_available():
+        raise RuntimeError("EIEA training requires CUDA")
+    torch.cuda.set_device(torch.device(args.device))
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
+    random.seed(args.seed)
 
-    from transformers import AutoProcessor
-    rows = json.load(open(args.data))
-    dev = torch.device(args.device)
-    torch.cuda.set_device(dev)
+    from model.eiea.ssr_eiea_common import (
+        VLM_BASE, load_midi, load_visual_encoders, load_vlm,
+    )
 
-    vlm = load_vlm(str(dev))
+    rows = load_rows(args.data)
+    corr_cfg = CorruptionConfig.preset(args.corruption)
+    print(f"loaded {len(rows)} rows; corruption={args.corruption}", flush=True)
+
+    midi, mtok = load_midi(args.device)
+    midi.eval()
+    for p in midi.parameters():
+        p.requires_grad_(False)
+
+    cfg = EIEAConfig(
+        hidden_size=args.hidden_size, d_vlm=args.d_vlm,
+        num_tor=args.num_tor, bev_channels=args.bev_channels,
+        freeze_mamba=not args.train_mamba, dropout=args.dropout,
+    )
+    encoder = EIEACueEncoder.from_midi(midi, cfg).to(args.device)
+    encoder.train()
+    clip_proc, clip, sig_proc, sig = load_visual_encoders(args.device)
+
+    if args.dry_run:
+        rng = random.Random(args.seed)
+        for i, r in enumerate(rows[:2]):
+            img = load_view_images(r, 1)[0]
+            corr = apply_corruption(boxes_from_row(r), load_bev(r, args.bev_channels),
+                                    load_depth(r), corr_cfg, rng)
+            with torch.no_grad():
+                ie = clip(**clip_proc(images=img, return_tensors="pt").to(args.device)).last_hidden_state.float()
+                de = None
+                if corr.depth is not None:
+                    de = sig(**sig_proc(images=corr.depth, return_tensors="pt").to(args.device)).last_hidden_state.float()
+                ids = mamba_text_ids(mtok, r).to(args.device)
+                cue, aux = encoder(ie, de, torch.from_numpy(corr.boxes).to(args.device),
+                                   None if corr.bev is None else torch.from_numpy(corr.bev).to(args.device),
+                                   None, ids, return_aux=True)
+            print(f"dry-run {i}: cue={tuple(cue.shape)} aux={aux['modalities']} "
+                  f"corruption={corr.summary()}", flush=True)
+        print("dry-run OK", flush=True)
+        return
+
+    vlm = load_vlm(args.device)
     vlm.train()
+    vlm.config.use_cache = False
     for p in vlm.parameters():
         p.requires_grad_(False)
-    vlm.gradient_checkpointing_enable()
-    proc = AutoProcessor.from_pretrained(
-        os.environ.get("SSR_VLM_BASE", "/dev/shm/models/Qwen2.5-VL-7B-Instruct"))
-    proc.tokenizer.add_tokens(TOR, special_tokens=True)
-    tid = proc.tokenizer.convert_tokens_to_ids(TOR)
+    vlm.gradient_checkpointing_enable(
+        gradient_checkpointing_kwargs={"use_reentrant": False})
+    proc = __import__("transformers").AutoProcessor.from_pretrained(VLM_BASE)
+    proc.tokenizer.add_tokens([args.tor_str], special_tokens=True)
+    cap_processor_pixels(proc, args.max_image_tokens)
 
-    midi, mtok = load_midi(str(dev))
-    for p in midi.parameters():
-        p.requires_grad_(True)
-    enc = load_visual_encoders(str(dev))
-    for m in enc[1::1]:
-        if isinstance(m, torch.nn.Module):
-            for p in m.parameters():
-                p.requires_grad_(False)
-    cp, clip, sp, sig = enc
-    model = BoxMIDI(midi).to(dev)
-    opt = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=args.lr)
+    midi_names = ("midi.image_proj", "midi.depth_proj")
+    midi_params = [p for n, p in encoder.named_parameters()
+                   if n.startswith(midi_names) and p.requires_grad]
+    new_params = [p for n, p in encoder.named_parameters()
+                  if not n.startswith(midi_names) and p.requires_grad]
+    opt = torch.optim.AdamW([
+        {"params": midi_params, "lr": args.lr_midi, "weight_decay": args.weight_decay},
+        {"params": new_params, "lr": args.lr, "weight_decay": args.weight_decay},
+    ])
 
-    def step(r):
-        im = Image.open(r["images"][1]).convert("RGB")
-        depth = np.load(r["depth"])
-        with torch.no_grad():
-            mdtype = next(model.parameters()).dtype
-            ie = clip(**cp(images=im, return_tensors="pt").to(dev)).last_hidden_state.float().to(mdtype)
-            de = sig(**sp(images=depth, return_tensors="pt").to(dev)).last_hidden_state.float().to(mdtype)
-        qids = mtok(r["question"] + insert_tor("", 10), add_special_tokens=False, return_tensors="pt")
-        boxes = torch.tensor(r["boxes"], dtype=torch.float32, device=dev) if r["boxes"] else torch.zeros(0, 13, device=dev)
-        cue = model(ie, de, boxes, qids.input_ids.to(dev), mtok.convert_tokens_to_ids(TOR))
-        cue = cue.unsqueeze(0).to(torch.bfloat16)
-        kw = prepare_vlm_batch(proc, r, dev, add_answer=r["answer"])
-        labels = answer_labels(proc, r, kw["input_ids"], dev)
-        out = vlm(**kw, labels=labels, tor_embeds=cue, tor_token_id=tid)
-        return out.loss
-
-    model.train()
-    import time
+    rng = random.Random(args.seed)
+    data_order = list(range(len(rows)))
+    random.Random(args.seed + 1).shuffle(data_order)
+    gray_path = None
+    if args.image_dropout > 0:
+        from PIL import Image
+        gray_path = "/tmp/eiea_gray_256.png"
+        Image.new("RGB", (256, 256), (128, 128, 128)).save(gray_path)
     t0 = time.time()
-    for i, r in enumerate(rows[:args.steps]):
-        loss = step(r)
+    for step in range(args.steps):
+        r = rows[data_order[step % len(data_order)]]
+        img = load_view_images(r, 1)[0]
+        corr = apply_corruption(boxes_from_row(r), load_bev(r, args.bev_channels),
+                                load_depth(r), corr_cfg, rng)
+        with torch.no_grad():
+            ie = clip(**clip_proc(images=img, return_tensors="pt").to(args.device)).last_hidden_state.float()
+            de = None
+            if corr.depth is not None:
+                de = sig(**sig_proc(images=corr.depth, return_tensors="pt").to(args.device)).last_hidden_state.float()
+        ids = mamba_text_ids(mtok, r).to(args.device)
+        cue = encoder(ie, de, torch.from_numpy(corr.boxes).to(args.device),
+                      None if corr.bev is None else torch.from_numpy(corr.bev).to(args.device),
+                      None, ids).to(torch.bfloat16)
+        r_vlm = r
+        if gray_path is not None and rng.random() < args.image_dropout:
+            r_vlm = dict(r)
+            r_vlm["images"] = [gray_path]
+        kw = prepare_vlm_batch(
+            proc, r_vlm, torch.device(args.device), n_views=1,
+            tor_str=args.tor_str, num_tor=args.num_tor,
+            answer=str(r.get("answer", "")))
+        keep = ("input_ids", "attention_mask", "pixel_values",
+                "image_grid_thw", "labels")
+        out = vlm(**{k: v for k, v in kw.items() if k in keep},
+                  tor_embeds=cue, tor_token_id=kw["tor_token_id"])
+        loss = out.loss / args.grad_accum
         loss.backward()
-        gn = torch.nn.utils.clip_grad_norm_([p for p in model.parameters() if p.requires_grad], 1.0)
-        opt.step(); opt.zero_grad(set_to_none=True)
-        if i % 10 == 0:
-            print(f"{i}/{min(args.steps, len(rows))} loss={loss.item():.4f} "
-                  f"grad={float(gn):.3f} {time.time() - t0:.0f}s", flush=True)
-        if args.smoke and i + 1 >= args.smoke:
+        if (step + 1) % args.grad_accum == 0:
+            torch.nn.utils.clip_grad_norm_(encoder.trainable_parameters(), 1.0)
+            opt.step()
+            opt.zero_grad(set_to_none=True)
+        if step % args.log_every == 0:
+            print(f"{step}/{args.steps} loss={out.loss.item():.4f} "
+                  f"corrupt={corr.summary()} {time.time() - t0:.0f}s", flush=True)
+        if args.save_every and (step + 1) % args.save_every == 0:
+            encoder.save_checkpoint(args.save, extra={
+                "step": step + 1, "args": vars(args),
+                "corruption": corr_cfg.to_dict()})
+        if args.smoke and step + 1 >= args.smoke:
             break
-    torch.save(model.state_dict(), args.save)
-    print("saved", args.save)
+
+    encoder.save_checkpoint(args.save, extra={
+        "step": step + 1, "args": vars(args),
+        "corruption": corr_cfg.to_dict()})
+    print(f"saved {args.save}", flush=True)
 
 
 if __name__ == "__main__":

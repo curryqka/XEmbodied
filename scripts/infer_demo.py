@@ -19,13 +19,15 @@ logger = logging.getLogger(__name__)
 # Model mode: True = custom VGGT-fused model | False = native Qwen3-VL-MoE
 USE_CUSTOM_MODEL = True
 
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
 # Custom model configuration (your fine-tuned merged checkpoint)
 CUSTOM_MODEL_CFG = {
-    # <-- UPDATE: set to your merged checkpoint directory -->
-    "model_path": os.path.join(os.path.dirname(__file__), "3DA", "my_qwen3_vggt_xattnv2", "base_ckpt"),
+    "model_path": os.environ.get(
+        "XEMB_MODEL_DIR", os.path.join(_ROOT, "model", "3da", "base_ckpt")),
     "model_type": "qwen3_vl_moe_vggt",
-    # <-- UPDATE: set to your register file path -->
-    "register_file": os.path.join(os.path.dirname(__file__), "3DA", "my_qwen3_vggt_xattnv2", "plugin", "qwen3_vl_moe_vggt_register.py"),
+    "register_file": os.path.join(
+        _ROOT, "model", "3da", "qwen3_vl_moe_vggt_register.py"),
 }
 
 # Native Qwen3-VL model configuration
@@ -49,9 +51,24 @@ INFER_CFG = {
         "Finally, provide a concise and definitive response in the <answer> tag. Use the following format:\n"
         "<answer>[Final answer]</answer>"
     ),
-    # <-- UPDATE: set to your test image path -->
-    "image_paths": [os.path.join(os.path.dirname(__file__), "..", "demo", "SURDS_demo.jpg")],
+    "image_paths": [os.environ.get(
+        "XEMB_DEMO_IMAGE", os.path.join(_ROOT, "demo", "sample.jpg"))],
 }
+
+
+def _ensure_sample_image(path: str) -> None:
+    """Create a synthetic quick-start image if the user did not supply one."""
+    if os.path.isfile(path):
+        return
+    from PIL import Image, ImageDraw
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    img = Image.new("RGB", (640, 360), (165, 190, 215))
+    d = ImageDraw.Draw(img)
+    d.rectangle([0, 250, 640, 360], fill=(90, 95, 100))       # road
+    d.rectangle([250, 160, 390, 260], fill=(210, 210, 215))   # car
+    d.ellipse([275, 245, 305, 270], fill=(30, 30, 30))
+    d.ellipse([335, 245, 365, 270], fill=(30, 30, 30))
+    img.save(path, quality=90)
 
 # -------------------------- Dependency Import --------------------------
 from swift.infer_engine import TransformersEngine, InferRequest, RequestConfig
@@ -104,6 +121,9 @@ if __name__ == "__main__":
     logger.info("=" * 50)
     logger.info("Qwen3-VL inference task started")
     logger.info("=" * 50)
+
+    for _p in INFER_CFG["image_paths"]:
+        _ensure_sample_image(_p)
 
     # 1. Initialize engine
     infer_engine = init_engine()

@@ -35,7 +35,7 @@ The model is designed for cloud-side autonomous-driving and robotics VQA in data
 Xiaomi-SpatialEmbodied uses Qwen3-VL-30B-A3B-Instruct as its multimodal language backbone and adds trainable spatial and embodied interfaces. Images are processed by the native Qwen vision tower and a VGGT 3D foundation model; the resulting features are aligned before language reasoning, so spatial evidence participates in the model's internal representation rather than being appended as text or an auxiliary depth map.
 
 - **3D Adapter (3DA):** VGGT extracts multi-layer geometric features from the same camera image. `VGGTEmbeddingMerger` resamples the VGGT patch grid to Qwen's image-token grid, applies token merging, normalization, and MLP projection, then injects the result through a cross-attention residual (image tokens query VGGT tokens). This preserves the original sequence length while adding depth, layout, and relative-position cues.
-- **Efficient Image-Embodied Adapter (EIEA):** Outputs from embodied tools such as occupancy, 3D boxes, and map cues are distilled into a compact set of TOR embeddings. These embeddings are inserted at designated positions in the MLLM context, providing physical affordance priors without exposing raw tool traces to the language model. This repository ships the inference consumer and precomputed caches.
+- **Efficient Image-Embodied Adapter (EIEA):** Outputs from embodied tools such as occupancy, 3D boxes, and map cues are distilled into a compact set of TOR embeddings. These embeddings are inserted at designated positions in the MLLM context, providing physical affordance priors without exposing raw tool traces to the language model. This repository ships the reference cue encoder/trainer (box + BEV map + depth, random masking and noise), the inference consumer, and precomputed demo caches.
 - **Progressive domain curriculum:** Training proceeds from general multimodal capability to spatial/3D supervision and then embodied driving and manipulation data. The staged recipe reduces catastrophic forgetting and yields consistent gains across the 18 benchmarks reported in the paper.
 
 The released main checkpoint is the 3DA variant under `model/3da/`; the connector variants in `./3DA/variants/` are provided for ablation studies.
@@ -138,7 +138,7 @@ The best results among the listed models are **bolded**.
 - [x] Release model code
 - [x] Release model weights
 - [x] Release inference code
-- [ ] Release training code
+- [x] Release training code (3DA 4-stage + EIEA reference trainer)
 - [x] Release evaluation code (`tools/eval_tools/`; the Table 3 embodied benchmarks that have no released scorer are marked in the table above)
 - [ ] Release dataset download
 
@@ -168,15 +168,15 @@ BaseModel-open/
 │   │   └── variants/                        # Experimental connector variants (not released)
 │   │       ├── my_qwen3_moe_vl_vggt_xattn_mlp/    # Configurable fusion + deepstack connectors
 │   │       └── my_qwen3_moe_vl_vggt_qformer/      # Q-Former main connector + deepstack MLP
-│   ├── EIEA/                                # Inference side only; see model/eiea/README.md
+│   ├── eiea/                                # EIEA reference implementation
 │   │   ├── README.md                        # Scope, quick start, known limitations
-│   │   ├── infer_with_EIEA_3D.py            # Loads the shipped TOR cache and runs inference
-│   │   ├── models/
-│   │   │   ├── qwen3_vl_vggt_register.py    # Registration with TOR physical embedding auto-injection
-│   │   │   ├── qwen3_vl_moe_vggt.py         # Model definition with physical-geometric dual enhancement
-│   │   │   └── ...
-│   │   ├── tor_embeds_cache_fb.pt           # Pre-cached TOR embeddings (loaded by qwen3_vl_vggt_register.py)
-│   │   └── tor_embeds_cache.pt              # Second, different TOR cache (see note below)
+│   │   ├── infer_with_EIEA_3D.py            # Loads a TOR cache and runs inference
+│   │   ├── cue_encoder.py                   # Mamba interpreter + box/BEV/depth/flow encoders
+│   │   ├── corruption.py                    # Random masking / noise training recipe
+│   │   ├── preprocess.py                    # VGGT 518x518 letterbox preprocessing
+│   │   ├── ssr_eiea_common.py               # 7B SSR proxy loaders
+│   │   ├── qwen3_vl_vggt_register.py        # Registration with TOR auto-injection
+│   │   └── qwen3_vl_moe_vggt.py             # Model definition with dual enhancement
 │   └── infer_demo.py                        # Basic VLM inference entry
 ├── demo/                                    # Synthetic sample image for the quick start
 ├── model_tools/                             # VGGT <-> Qwen grid-alignment debug tooling
@@ -205,6 +205,7 @@ The 4-stage training scripts live in `model/3da/scripts/`
 | [`README.md`](README.md) | Overview, results, environment, inference quick start |
 | [`./3DA/README.md`](./3DA/README.md) | 3DA layout, main model vs. variants, VGGT/Qwen grid alignment |
 | [`model/eiea/README.md`](model/eiea/README.md) | EIEA scope, quick start, known limitations |
+| [`docs/EIEA_TRAINING.md`](docs/EIEA_TRAINING.md) | EIEA cues, masking/noise recipe, training/eval commands |
 | [`tools/README_TOOLS.md`](tools/README_TOOLS.md) | Data conversion / evaluation / visualization scripts |
 
 ## Model Architecture
@@ -263,9 +264,15 @@ While prior work leverages embodied-specific tools (e.g., occupancy grids, 3D bo
 
 EIEA shares the model's underlying structure with 3DA, together forming Xiaomi-SpatialEmbodied's complete embodied perception capability.
 
-> **Scope of this release**: the repository ships a pre-computed TOR embedding cache
-> (`model/eiea/tor_embeds_cache*.pt`) together with the inference code that loads and
-> injects it. **The EIEA pipeline that produces such a cache is not open-sourced at this time.**
+> **Scope of this release**: the repository ships the EIEA reference encoder,
+> training recipe (box + BEV map + depth, random masking and noise) and an
+> inference consumer for a pre-computed TOR cache. The old external demo caches
+> (`tor_embeds_cache*.pt`, 10×3584) are **not bundled** and are **not**
+> compatible with the 30B model's 2048-d embeddings; the register warns and
+> skips injection unless a matching cache is supplied. The paper's Stage-4 EIEA
+> weights are not part of this release. See
+> [`docs/EIEA_TRAINING.md`](docs/EIEA_TRAINING.md) and
+> [`model/eiea/README.md`](model/eiea/README.md).
 
 ## Environment Setup
 
@@ -320,12 +327,12 @@ Before running any inference script, configure the paths to your local model che
 |------|------------------|-------|
 | Qwen3-VL-30B-A3B-Instruct | `Qwen/Qwen3-VL-30B-A3B-Instruct` | Base model, supports auto-download |
 | VGGT-1B weights (`model.pt`) | anywhere on disk; pass it to `save_qwen3_vl_moe_vggt.py` via `--vggt_ckpt_path` | Download from [facebook/VGGT-1B](https://huggingface.co/facebook/VGGT-1B). **Review the VGGT licence before redistributing any fused checkpoint.** |
-| VGGT backbone code | directory that *contains* the `vggt/` package, set via `VGGT_REPO_DIR` | A copy ships at `model/3da/vggt/`, so `VGGT_REPO_DIR=model/3da` works. The built-in default does **not** resolve — always export it. |
+| VGGT backbone code | directory that *contains* the `vggt/` package, set via `VGGT_REPO_DIR` | A copy ships at `model/3da/vggt/`; the built-in default already resolves to `model/3da`. Export `VGGT_REPO_DIR` only for a custom layout. |
 | Trained model weights | Kaggle Model Scope | Full trainable weights: https://www.kaggle.com/models/zhongyangtony/./ |
-| VGGT register file | `model/3da/plugin/qwen3_vl_moe_vggt_register.py` | MS-Swift model registration file (main model; variants live in `./3DA/variants/`) |
-| EIEA register file | `model/eiea/models/qwen3_vl_vggt_register.py` | Registration with physical embedding injection |
-| TOR embedding cache | `model/eiea/tor_embeds_cache_fb.pt` | Pre-computed cache shipped with the repo. The EIEA pipeline that generates it is not open-sourced yet. |
-| second TOR cache | `model/eiea/tor_embeds_cache.pt` | Different contents from `_fb.pt`. `qwen3_vl_vggt_register.py` loads **only** `_fb.pt` (`TOR_EMBEDS_PATH`, line 32); swap that constant if you want to run the other cache. |
+| VGGT register file | `model/3da/qwen3_vl_moe_vggt_register.py` | MS-Swift model registration file (main model) |
+| EIEA register file | `model/eiea/qwen3_vl_vggt_register.py` | Registration with physical embedding injection |
+| TOR embedding cache | `XEMB_TOR_CACHE` | Optional external cache (not bundled). Must be `10 × d_vlm`; the old 10×3584 demo cache is **not** compatible with the 30B model's 2048-d embeddings. If absent/mismatched, the register warns and skips injection. |
+| TOR marker id | `XEMB_TOR_TOKEN_ID` | Placeholder token id (default `151643`, `<|endoftext|>`); the prompt must contain exactly `K` markers. |
 
 ### Setup Steps
 
@@ -345,7 +352,7 @@ Before running any inference script, configure the paths to your local model che
      --vggt_repo_dir   /path/to/model/3da \
      --output_dir      model/3da/base_ckpt
    ```
-   Alternatively, point `CUSTOM_MODEL_CFG["model_path"]` in `./infer_demo.py` at the
+   Alternatively, point `CUSTOM_MODEL_CFG["model_path"]` in `scripts/infer_demo.py` at the
    checkpoint you downloaded from Kaggle — that one is already fused.
 4. **EIEA physical embedding**: The repository includes pre-cached TOR embedding files — no extra pretrained model downloads required.
 5. **Training**: the 4-stage recipe is encoded in `model/3da/scripts/sft_ddp_s{1..4}*.sh`; each stage's `--model` points at the previous stage's merged checkpoint.
@@ -364,7 +371,7 @@ export VGGT_REPO_DIR=$PWD/model/3da   # parent of the vggt/ package
 export VGGT_DEVICE=cuda:0
 export VGGT_DTYPE=bfloat16
 
-python ./infer_demo.py
+python scripts/infer_demo.py
 ```
 
 Script configuration:
@@ -397,16 +404,18 @@ INFER_CFG = {
 
 ### Method 2: EIEA Physical-Geometric Dual Enhancement Inference
 
-Use `model/eiea/infer_with_EIEA_3D.py` to load the shipped TOR cache and run inference with physical cue injection:
+Use `model/eiea/infer_with_EIEA_3D.py` to load a TOR cache and run inference with physical cue injection:
 
 ```bash
-cd model/eiea
-python infer_with_EIEA_3D.py
+python model/eiea/infer_with_EIEA_3D.py \
+  --model_path /path/to/xembodied-v0 \
+  --image /path/to/front.jpg \
+  --tor_cache /path/to/cue_10x2048.pt   # omit to run without cue injection
 ```
 
 This script shows how to load the TOR embedding cache shipped with the repository and inject it, combining the physical branch with the VGGT geometric branch for dual-cue inference. No extra pretrained models need to be downloaded.
 
-> ⚠️ The repository provides **one pre-computed TOR embedding cache** and the inference code that loads and injects it; **the EIEA pipeline that generates such a cache is not open-sourced at this time**. The demo therefore injects a **fixed soft prompt** rather than deriving physical priors per input image.
+> ⚠️ The demo cache is the old 10×3584 fixed soft prompt, not a per-image cue. The repository now also contains the EIEA reference encoder and a training/evaluation recipe (`training/train_eiea_30b.py`, `docs/EIEA_TRAINING.md`), but the paper's Stage-4 EIEA weights are not released. The register validates the cache width against the loaded model and skips auto-injection on a mismatch.
 
 ## Tools
 

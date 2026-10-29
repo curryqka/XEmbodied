@@ -35,7 +35,7 @@
 Xiaomi-SpatialEmbodied 以 Qwen3-VL-30B-A3B-Instruct 为多模态语言骨干，并增加可训练的空间与具身接口。每张图像同时经过 Qwen 视觉塔和 VGGT 三维基础模型，特征在语言推理前完成对齐，使空间证据进入模型内部表示，而不是作为文本或外部深度图拼接。
 
 - **3D Adapter（3DA）**：VGGT 从同一相机图像提取多层几何特征；`VGGTEmbeddingMerger` 将 VGGT patch 网格重采样到 Qwen 图像 token 网格，经过 token 合并、归一化和 MLP 投影，再通过交叉注意力残差注入（图像 token 查询 VGGT token）。该设计不改变原始序列长度，同时补充深度、布局和相对位置线索。
-- **Efficient Image-Embodied Adapter（EIEA）**：将占据栅格、3D 框和高精地图等具身工具输出蒸馏为紧凑的 TOR embedding，并在指定位置注入 MLLM 上下文，为模型提供物理可供性先验。本仓库提供推理侧消费者和预计算缓存。
+- **Efficient Image-Embodied Adapter（EIEA）**：将占据栅格、3D 框和高精地图等具身工具输出蒸馏为紧凑的 TOR embedding，并在指定位置注入 MLLM 上下文，为模型提供物理可供性先验。本仓库提供参考线索编码器/训练脚本（box + BEV map + depth，随机掩码与加噪）、推理侧消费者和预计算 demo 缓存。
 - **渐进式领域课程**：训练从通用多模态能力开始，逐步加入空间/3D 监督，再过渡到自动驾驶和机器人数据，以减少灾难性遗忘；论文报告的 18 个基准均验证了稳定增益。
 
 正式发布的主模型位于 `model/3da/`；`./3DA/variants/` 中的连接器用于消融实验。
@@ -138,7 +138,7 @@ Xiaomi-SpatialEmbodied 以 Qwen3-VL-30B-A3B-Instruct 为多模态语言骨干，
 - [x] 发布模型代码
 - [x] 发布模型权重
 - [x] 发布推理代码
-- [ ] 发布训练代码
+- [x] 发布训练代码（3DA 四阶段 + EIEA 参考训练脚本）
 - [x] 发布评测代码（`tools/eval_tools/`；Table 3 中未提供评分脚本的具身基准已在上表中标注）
 - [ ] 发布数据集下载
 
@@ -170,7 +170,7 @@ BaseModel-open/
 │   │       └── my_qwen3_moe_vl_vggt_qformer/      # Q-Former 主连接器 + deepstack MLP
 │   ├── EIEA/                                # 仅推理侧；详见 model/eiea/README.md
 │   │   ├── README.md                        # 开源范围、快速开始、已知限制
-│   │   ├── infer_with_EIEA_3D.py            # 加载随仓库提供的 TOR 缓存并推理
+│   │   ├── infer_with_EIEA_3D.py            # 加载 TOR 缓存并推理
 │   │   ├── models/
 │   │   │   ├── qwen3_vl_vggt_register.py    # 集成 TOR 物理嵌入注入的模型注册文件
 │   │   │   ├── qwen3_vl_moe_vggt.py         # 支持物理-几何双增强的模型定义
@@ -192,6 +192,7 @@ BaseModel-open/
 | [`README_CN.md`](README_CN.md) | 总览、实验结果、环境、推理快速开始 |
 | [`./3DA/README.md`](./3DA/README.md) | 3DA 目录布局、主模型 vs 变体、VGGT/Qwen 网格对齐 |
 | [`model/eiea/README.md`](model/eiea/README.md) | EIEA 开源范围、快速开始、已知限制 |
+| [`docs/EIEA_TRAINING.md`](docs/EIEA_TRAINING.md) | EIEA 线索、掩码/加噪配方、训练与评测命令 |
 | [`tools/README_TOOLS.md`](tools/README_TOOLS.md) | 数据转换 / 评测 / 可视化脚本 |
     ├── convert_data_tools/                 # 数据集格式转换脚本
     ├── parse_io_tools/                     # 原始数据集解析（Parquet/Arrow/PKL）
@@ -253,8 +254,9 @@ vggt_connector_config = {
 
 EIEA 与 3DA 共享模型底层结构，共同构成 Xiaomi-SpatialEmbodied 的完整具身感知能力。
 
-> **本次开源范围**：本仓库提供一份预计算的 TOR 嵌入缓存（`model/eiea/tor_embeds_cache*.pt`）以及使用该缓存的推理代码；
-> **生成该缓存的 EIEA 流程暂未开源**。
+> **本次开源范围**：本仓库提供 EIEA 参考编码器、训练配方（box + BEV map + depth，随机掩码与加噪）以及预计算 TOR 缓存的推理代码。
+> 旧的外部 demo 缓存（`tor_embeds_cache*.pt`，10×3584）**未随仓库打包**，且**与 30B 模型的 2048 维词嵌入不匹配**；注册文件会检测维度并跳过注入，除非提供匹配的缓存。
+> 论文 Stage-4 的 EIEA 权重不在本次发布范围内。详见 [`docs/EIEA_TRAINING.md`](docs/EIEA_TRAINING.md) 与 [`model/eiea/README.md`](model/eiea/README.md)。
 
 ## 环境配置
 
@@ -306,12 +308,12 @@ pip install aenum sentencepiece protobuf
 |------|----------|----------|
 | Qwen3-VL-30B-A3B-Instruct | `Qwen/Qwen3-VL-30B-A3B-Instruct` | 基座模型，支持自动下载 |
 | VGGT-1B 权重（`model.pt`） | 磁盘任意位置，经 `--vggt_ckpt_path` 传给 `save_qwen3_vl_moe_vggt.py` | 从 [facebook/VGGT-1B](https://huggingface.co/facebook/VGGT-1B) 下载。**再分发融合权重前请先确认 VGGT 许可证。** |
-| VGGT 骨干代码 | 含 `vggt/` 包的**父目录**，经 `VGGT_REPO_DIR` 指定 | 仓库自带一份：`model/3da/vggt/`，故 `VGGT_REPO_DIR=model/3da` 即可。内置默认值**不解析**，务必显式 export。 |
+| VGGT 骨干代码 | 含 `vggt/` 包的**父目录**，经 `VGGT_REPO_DIR` 指定 | 仓库自带一份：`model/3da/vggt/`；内置默认值已解析到 `model/3da`。仅在自定义目录时需要 export。 |
 | 训练完成模型权重 | Kaggle Model Scope 下载 | 可推理的完整权重：https://www.kaggle.com/models/zhongyangtony/./ |
-| VGGT 注册文件 | `model/3da/plugin/qwen3_vl_moe_vggt_register.py` | MS-Swift 模型注册文件（主模型；变体见 `./3DA/variants/`） |
-| EIEA 注册文件 | `model/eiea/models/qwen3_vl_vggt_register.py` | 集成物理嵌入注入的注册文件 |
-| TOR 嵌入缓存 | `model/eiea/tor_embeds_cache_fb.pt` | 随仓库提供的预计算缓存；生成它的 EIEA 流程暂未开源 |
-| 第二份 TOR 缓存 | `model/eiea/tor_embeds_cache.pt` | 内容与 `_fb.pt` **不同**。`qwen3_vl_vggt_register.py` 只加载 `_fb.pt`（`TOR_EMBEDS_PATH`，第 32 行）；要用这份需改该常量。 |
+| VGGT 注册文件 | `model/3da/qwen3_vl_moe_vggt_register.py` | MS-Swift 模型注册文件（主模型） |
+| EIEA 注册文件 | `model/eiea/qwen3_vl_vggt_register.py` | 集成物理嵌入注入的注册文件 |
+| TOR 嵌入缓存 | `XEMB_TOR_CACHE` | 可选外部缓存（未随仓库打包）。必须为 `10 × d_vlm`；旧的 10×3584 demo 缓存与 30B 的 2048 维不匹配。缺失或不匹配时注册文件会告警并跳过注入。 |
+| TOR 占位符 id | `XEMB_TOR_TOKEN_ID` | 默认 `151643`（`<|endoftext|>`）；prompt 中必须恰好有 `K` 个占位符。 |
 
 ### 配置步骤
 1. **下载基座 VLM**：下载 [Qwen3-VL-30B-A3B-Instruct](https://huggingface.co/Qwen/Qwen3-VL-30B-A3B-Instruct) 或由 MS-Swift 自动下载
@@ -329,7 +331,7 @@ pip install aenum sentencepiece protobuf
      --vggt_repo_dir   /path/to/model/3da \
      --output_dir      model/3da/base_ckpt
    ```
-   也可以直接把 `./infer_demo.py` 里 `CUSTOM_MODEL_CFG["model_path"]` 指向 Kaggle 下载的权重（那份已经融合过）。
+   也可以直接把 `scripts/infer_demo.py` 里 `CUSTOM_MODEL_CFG["model_path"]` 指向 Kaggle 下载的权重（那份已经融合过）。
 4. **EIEA 物理嵌入准备**：仓库已内置预缓存 TOR 嵌入文件，无需额外下载预训练模型，直接使用即可
 5. **训练**：4 阶段配方编码在 `model/3da/scripts/sft_ddp_s{1..4}*.sh` 中；每阶段的 `--model` 指向上一阶段的 merged checkpoint
 
@@ -345,7 +347,7 @@ export VGGT_REPO_DIR=$PWD/model/3da   # vggt/ 包的父目录
 export VGGT_DEVICE=cuda:0
 export VGGT_DTYPE=bfloat16
 
-python ./infer_demo.py
+python scripts/infer_demo.py
 ```
 
 脚本配置项：
@@ -376,17 +378,18 @@ INFER_CFG = {
 ```
 
 ### 方式二：EIEA 物理-几何双增强推理
-使用 `model/eiea/infer_with_EIEA_3D.py` 加载随仓库提供的 TOR 缓存并运行物理线索注入推理：
+使用 `model/eiea/infer_with_EIEA_3D.py` 加载 TOR 缓存并运行物理线索注入推理：
 
 ```bash
-cd model/eiea
-python infer_with_EIEA_3D.py
+python model/eiea/infer_with_EIEA_3D.py \
+  --model_path /path/to/xembodied-v0 \
+  --image /path/to/front.jpg \
+  --tor_cache /path/to/cue_10x2048.pt   # 省略则不做线索注入
 ```
 
 该脚本演示如何加载随仓库提供的 TOR 嵌入缓存并完成注入，配合 VGGT 几何分支做物理-几何双线索推理。无需下载额外预训练模型。
 
-> ⚠️ 仓库只提供**一份预计算的 TOR 嵌入缓存**与使用它的推理代码；**生成该缓存的 EIEA 流程暂未开源**。
-> 因此在示例中注入的是一段**固定的软提示**，而不是针对每张输入图实时生成的物理先验。
+> ⚠️ 演示缓存是旧的 10×3584 固定软提示，不是针对每张输入图实时生成的物理先验。仓库现在还包含 EIEA 参考编码器与训练/评测配方（`training/train_eiea_30b.py`、`docs/EIEA_TRAINING.md`），但论文 Stage-4 的 EIEA 权重未发布。注册文件会校验缓存维度，不匹配时跳过自动注入。
 
 ## 工具集
 

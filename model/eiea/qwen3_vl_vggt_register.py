@@ -27,17 +27,21 @@ from swift.template.utils import findall
 # ==============================================================================
 # TOR EMBEDDING Configuration (modify your TOR parameters here)
 # ==============================================================================
-TOR_TOKEN_ID = 151643  # TOR special token ID
-# <-- UPDATE: set to your TOR embedding cache file path -->
-TOR_EMBEDS_PATH = os.path.join(os.path.dirname(__file__), "tor_embeds_cache_fb.pt")
-TOR_HIDDEN_SIZE = 3584  # Model hidden size (fixed at 3584 for Qwen3-VL)
+TOR_TOKEN_ID = int(os.environ.get("XEMB_TOR_TOKEN_ID", "151643"))
+# Pre-computed TOR cache (optional; not bundled).  The old external demo
+# cache is 10 x 3584 (early Qwen2.5-VL-7B prototype) and is NOT compatible with
+# the 30B model's 2048-d word embeddings.  Set XEMB_TOR_CACHE to a matching
+# cache for real use.
+TOR_EMBEDS_PATH = os.environ.get(
+    "XEMB_TOR_CACHE",
+    os.path.join(os.path.dirname(__file__), "tor_embeds_cache_fb.pt"))
 
 # ==============================================================================
 # Paths
 # ==============================================================================
 _PLUGIN_DIR = Path(__file__).resolve().parent
 _PROJECT_DIR = _PLUGIN_DIR.parent
-_DEFAULT_VGGT_REPO_DIR = str(Path(__file__).resolve().parents[3] / "vggt")
+_DEFAULT_VGGT_REPO_DIR = str(Path(__file__).resolve().parent.parent / "3da")
 
 if str(_PROJECT_DIR) not in sys.path:
     sys.path.insert(0, str(_PROJECT_DIR))
@@ -376,28 +380,42 @@ class Qwen3VLVGGTTemplate(Qwen3VLTemplate):
             ]
         
         # Auto-load TOR Embedding (core: no manual parameter passing needed)
-        try:
-            # Load TOR embeddings
-            # tor_embeds = torch.load(TOR_EMBEDS_PATH, map_location=model.device, weights_only=False)
-            cache = torch.load(TOR_EMBEDS_PATH, map_location=model.device, weights_only=False)
-            vlm_inputs = cache["vlm_inputs"]
-            tor_embeds = cache["tor_embeds"]
-            tor_token_id_vlm = cache["tor_token_id_vlm"]
-            pad_token_id = cache["pad_token_id"]
-            eos_token_id = cache["eos_token_id"]
-            # Align format: [1, 10, 3584]
-            if tor_embeds.dim() == 2:
-                tor_embeds = tor_embeds.unsqueeze(0)
-            # Align precision and device
-            tor_embeds = tor_embeds.to(dtype=model.dtype, device=model.device)
-            
-            # Pass TOR embeddings directly to model.generate()
-            kwargs["tor_embeds"] = tor_embeds
-            kwargs["tor_token_id"] = TOR_TOKEN_ID
-            # kwargs["tor_token_id_vlm"] = tor_token_id_vlm
-            print(f"TOR Embedding auto-injection successful | shape: {tor_embeds.shape} | token_id: {TOR_TOKEN_ID}")
-        except Exception as e:
-            print(f"WARNING: TOR Embedding loading failed: {e}, continuing with native model")
+        # Validate the cache width against the actual VLM word-embedding size.
+        # The shipped 10x3584 cache comes from the early 7B prototype and must
+        # not be scattered into a 30B (2048-d) model; doing so used to surface
+        # as a cryptic masked_scatter error or, worse, a silent no-op.
+        if kwargs.get("tor_embeds") is None:
+            try:
+                cache = torch.load(TOR_EMBEDS_PATH, map_location=model.device,
+                                   weights_only=False)
+                tor_embeds = cache["tor_embeds"]
+                if tor_embeds.dim() == 2:
+                    tor_embeds = tor_embeds.unsqueeze(0)
+                expected = getattr(model.config.text_config, "hidden_size", None)
+                if expected is not None and int(tor_embeds.shape[-1]) != int(expected):
+                    msg = (
+                        f"TOR cache width {tor_embeds.shape[-1]} != model "
+                        f"word-embedding size {expected} ({TOR_EMBEDS_PATH}); "
+                        "skipping auto-injection. Set XEMB_TOR_CACHE to a "
+                        "matching cache.")
+                    if os.environ.get("XEMB_EIEA_STRICT_CACHE", "0") == "1":
+                        raise ValueError(msg)
+                    print("WARNING:", msg)
+                else:
+                    tor_embeds = tor_embeds.to(dtype=model.dtype, device=model.device)
+                    kwargs["tor_embeds"] = tor_embeds
+                    kwargs["tor_token_id"] = TOR_TOKEN_ID
+                    print(f"TOR Embedding auto-injection successful | "
+                          f"shape: {tor_embeds.shape} | token_id: {TOR_TOKEN_ID}")
+            except FileNotFoundError:
+                print(f"WARNING: TOR cache not found at {TOR_EMBEDS_PATH}; "
+                      "continuing with native model")
+            except Exception as e:
+                if (os.environ.get("XEMB_EIEA_STRICT_CACHE", "0") == "1"
+                        and isinstance(e, ValueError)):
+                    raise
+                print(f"WARNING: TOR Embedding loading failed: {e}, "
+                      "continuing with native model")
 
         # 4. Call model generation
         return super().generate(model, *args, **kwargs)

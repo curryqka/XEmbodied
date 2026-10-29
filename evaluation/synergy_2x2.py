@@ -13,12 +13,15 @@ import sys
 import torch
 from PIL import Image
 
-MODEL_DIR = "/dev/shm/models/xembodied-v0"
-EIEA_DIR = "/home/kaneqian/XEmbodied/code/xembodied-code - AAAI/xembodied/EIEA/models"
-PROJ = ("/home/kaneqian/XEmbodied/code/xembodied-code - AAAI/xembodied/3DA/"
-        "my_qwen3_vggt_xattnv2")
-OUT = "/home/kaneqian/XEmbodied/results/eiea_box"
-CUE_DIR = "/tmp/eiea_cues"
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
+
+MODEL_DIR = os.environ.get("XEMB_MODEL_DIR", "/dev/shm/models/xembodied-v0")
+EIEA_DIR = os.path.join(ROOT, "model", "eiea")
+PROJ = os.path.join(ROOT, "model", "3da")
+OUT = os.environ.get("EIEABOX_OUT", os.path.join(ROOT, "results", "eiea_box"))
+CUE_DIR = os.environ.get("EIEABOX_CUE_DIR", "/tmp/eiea_cues")
 TOR_ID = 151643
 TOR_STR = "<|endoftext|>"
 TERSE = "\nRespond with only the final answer in <answer></answer>; do not explain."
@@ -71,11 +74,8 @@ def main():
     mod = importlib.util.module_from_spec(spec); sys.modules["eiea_modeling"] = mod
     spec.loader.exec_module(mod)
     C = mod.Qwen3VLMoeVGGTForConditionalGeneration
-    spec2 = importlib.util.spec_from_file_location(
-        "xreg3da", PROJ + "/plugin/qwen3_vl_moe_vggt_register.py")
-    reg = importlib.util.module_from_spec(spec2); sys.modules["xreg3da"] = reg
-    spec2.loader.exec_module(reg)
-    prep = reg._preprocess_image_to_vggt_tensor
+    from model.eiea.preprocess import preprocess_image_to_vggt_tensor as prep
+    os.environ.setdefault("VGGT_REPO_DIR", PROJ)
 
     cfg = AutoConfig.from_pretrained(MODEL_DIR, trust_remote_code=True)
     n = cfg.text_config.num_hidden_layers

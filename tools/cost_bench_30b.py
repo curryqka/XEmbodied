@@ -2,12 +2,17 @@
 """Inference cost on XEmbodied 30B: no-cue vs text-cue prompt (front view)."""
 import argparse
 import json
+import os
 import statistics
+import sys
 import time
 
 import torch
 
-OUT = "/home/kaneqian/XEmbodied/results/eiea_box"
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
+OUT = os.environ.get("EIEABOX_OUT", os.path.join(ROOT, "results", "eiea_box"))
 
 
 def main():
@@ -18,13 +23,13 @@ def main():
     args = ap.parse_args()
     from swift.utils import import_external_file
     from swift.infer_engine import TransformersEngine, InferRequest, RequestConfig
-    reg = ("/home/kaneqian/XEmbodied/code/xembodied-code - AAAI/xembodied/3DA/"
-           "my_qwen3_vggt_xattnv2/plugin/qwen3_vl_moe_vggt_register.py")
+    os.environ.setdefault("VGGT_REPO_DIR", os.path.join(ROOT, "model", "3da"))
+    reg = os.path.join(ROOT, "model", "3da", "qwen3_vl_moe_vggt_register.py")
     import_external_file(reg)
     eng = TransformersEngine(model=args.model_path, model_type="qwen3_vl_moe_vggt",
                              torch_dtype="bfloat16", trust_remote_code=True,
                              device_map="auto", max_memory={0: "43GiB", 1: "43GiB"})
-    rows = json.load(open("/home/kaneqian/XEmbodied/results/eiea_box/val_cues.json"))[:args.limit]
+    rows = json.load(open(os.path.join(OUT, "val_cues.json")))[:args.limit]
 
     def req(r, cues):
         p = r["question"].replace("<image>", "")

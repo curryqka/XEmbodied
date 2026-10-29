@@ -32,14 +32,18 @@ from swift.template.utils import findall
 # Paths
 # ==============================================================================
 _PLUGIN_DIR = Path(__file__).resolve().parent
-_PROJECT_DIR = _PLUGIN_DIR.parent  # .../my_qwen3_vggt_xattn_mlp
-# This project lives at:
-#   ms-swift/examples/custom/4d-intelligence/my_qwen3_vggt_xattn_mlp/plugin/...
-# so parents[3] is `.../examples/custom`.
-_DEFAULT_VGGT_REPO_DIR = str(Path(__file__).resolve().parents[3] / "vggt")
+_PROJECT_DIR = _PLUGIN_DIR.parent  # model/
+# This repository keeps the modeling file in model/3da/ and the VGGT package
+# in model/3da/vggt/, so the default VGGT repo dir is the file's own directory.
+_DEFAULT_VGGT_REPO_DIR = str(Path(__file__).resolve().parent)
 
 if str(_PROJECT_DIR) not in sys.path:
     sys.path.insert(0, str(_PROJECT_DIR))
+# In this repository the register and modeling file share model/3da/; the
+# upstream layout had them in variant root + plugin/, so add the file's own
+# directory for `from modeling_qwen3_vl_moe_vggt import ...`.
+if str(_PLUGIN_DIR) not in sys.path:
+    sys.path.insert(0, str(_PLUGIN_DIR))
 
 
 # ==============================================================================

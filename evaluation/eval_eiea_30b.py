@@ -1,189 +1,228 @@
 #!/usr/bin/env python3
-"""Evaluate the trained 30B EIEA path (SSR cue encoder + 3584->2048 projection)."""
+"""Evaluate a trained EIEA cue encoder on frozen Qwen3-VL-30B-A3B.
+
+The evaluation mirrors the rebuttal stress test: regenerate the K cue tokens
+for every condition while keeping the VLM, prompt and decoding fixed, then
+report multiple-choice accuracy / numeric MAE and the paired change relative
+to clean cues.  Conditions include whole-modality removal, partial cues,
+box drop/jitter, BEV mask/noise, and depth noise/mask, plus ``no_cue`` (no
+injection at all) as the "is the cue being used?" control.
+
+Example:
+    python evaluation/eval_eiea_30b.py \
+        --model_dir /dev/shm/models/xembodied-v0 \
+        --ckpt results/eiea_box/eiea_30b_box_bev_depth.pt \
+        --data results/eiea_box/val_bev.json \
+        --limit 100 --out results/eiea_box/eval_eiea_30b.json
+"""
+from __future__ import annotations
+
 import argparse
-import importlib.util
 import json
 import os
+import random
 import re
 import statistics
 import sys
-import time
+from pathlib import Path
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 import torch
-import torch.nn as nn
-from PIL import Image
 
-from ssr_eiea_common import TOR, load_midi, load_visual_encoders
-from ssr.utils.prompt import insert_tor
-from train_e2e import E2EEncoder
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
-MODEL_DIR = "/dev/shm/models/xembodied-v0"
-EIEA_DIR = "/home/kaneqian/XEmbodied/code/xembodied-code - AAAI/xembodied/EIEA/models"
-PROJ = ("/home/kaneqian/XEmbodied/code/xembodied-code - AAAI/xembodied/3DA/"
-        "my_qwen3_vggt_xattnv2")
-OUT = "/home/kaneqian/XEmbodied/results/eiea_box"
-TOR_ID = 151643
-TOR_STR = "<|endoftext|>"
-TERSE = "\nRespond with only the final answer in <answer></answer>; do not explain."
-CONDS = ["clean", "no_boxes", "wrong_scene", "no_cue"]
+from model.eiea.corruption import EVAL_CONDITIONS, apply_eval_condition
+from model.eiea.cue_encoder import EIEACueEncoder
+from model.eiea.preprocess import make_image_tchw
+from training.eiea_data import (
+    boxes_from_row, cap_processor_pixels, extract_answer, is_numeric, load_bev,
+    load_depth, load_rows, load_view_images, mamba_text_ids,
+    prepare_vlm_batch, score_answer,
+)
+
+DEFAULT_MODEL_DIR = os.environ.get("XEMB_MODEL_DIR", "/dev/shm/models/xembodied-v0")
+DEFAULT_TOR_STR = "<|endoftext|>"
 
 
-def score(pred, gt):
-    gu = str(gt).strip().upper(); up = pred.strip().upper()
-    if re.fullmatch(r"[A-D]", gu):
-        if re.fullmatch(r"[\(\[]?[A-D][\)\].:]?", up.strip()):
-            return int(up.strip("().[]: ")[0] == gu)
-        m = re.search(r"(?:answer is|answer\s*[:：])\s*[\(\[]?([A-D])\b", up)
-        if m:
-            return int(m.group(1) == gu)
-        letters = re.findall(r"(?:^|[\s:：])([A-D])[\.\):：]", up)
-        return int((letters[-1] if letters else up[:1]) == gu)
-    try:
-        g = float(gt)
-    except ValueError:
-        return int(gu in up)
-    nums = re.findall(r"-?\d+(?:\.\d+)?", pred)
-    return int(bool(nums) and abs(float(nums[0]) - g) < 1e-3)
+def parse_args():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--model_dir", default=DEFAULT_MODEL_DIR)
+    ap.add_argument("--ckpt", required=True)
+    ap.add_argument("--data", required=True)
+    ap.add_argument("--out", default="results/eiea_box/eval_eiea_30b.json")
+    ap.add_argument("--limit", type=int, default=100)
+    ap.add_argument("--max_new_tokens", type=int, default=64)
+    ap.add_argument("--n_views", type=int, default=1)
+    ap.add_argument("--max_image_tokens", type=int, default=1024)
+    ap.add_argument("--bev_channels", type=int, default=5)
+    ap.add_argument("--device", default="cuda:0")
+    ap.add_argument("--gpu_layers", type=int, default=22)
+    ap.add_argument("--tor_str", default=DEFAULT_TOR_STR)
+    ap.add_argument("--conditions", nargs="+", default=None,
+                    help=f"default: {EVAL_CONDITIONS + ['wrong_scene', 'no_cue']}")
+    ap.add_argument("--seed", type=int, default=0)
+    return ap.parse_args()
+
+
+def mc_summary(records: List[Dict[str, Any]]) -> Dict[str, Any]:
+    mc = [r for r in records if not is_numeric(r["gt"])]
+    num = [r for r in records if is_numeric(r["gt"]) and isinstance(r["score"], float)]
+    return {
+        "n": len(records),
+        "mc_n": len(mc),
+        "mc_acc": (sum(r["score"] for r in mc) / len(mc)) if mc else None,
+        "num_n": len(num),
+        "num_mae": (sum(abs(r["score"]) for r in num) / len(num)) if num else None,
+    }
+
+
+def paired_delta(records: Dict[str, List[Dict[str, Any]]],
+                 cond: str, ref: str = "clean") -> Dict[str, Any]:
+    """Paired MC delta vs the clean condition (same qids)."""
+    if ref not in records or cond not in records:
+        return {}
+    a = {r["qid"]: r for r in records[ref]}
+    b = {r["qid"]: r for r in records[cond]}
+    qids = [q for q in a if q in b and not is_numeric(a[q]["gt"])]
+    if not qids:
+        return {}
+    da = [int(a[q]["score"]) for q in qids]
+    db = [int(b[q]["score"]) for q in qids]
+    diff = 100.0 * (sum(db) - sum(da)) / len(qids)
+    # normal-approximation 95% CI on the paired difference
+    deltas = np.asarray(db, dtype=float) - np.asarray(da, dtype=float)
+    se = float(np.std(deltas, ddof=1) / np.sqrt(len(deltas))) if len(deltas) > 1 else 0.0
+    changed = sum(1 for q in qids if a[q].get("pred") != b[q].get("pred"))
+    return {"mc_n": len(qids), "delta_pts": diff,
+            "ci95": [diff - 1.96 * 100 * se, diff + 1.96 * 100 * se],
+            "changed": changed}
 
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--limit", type=int, default=100)
-    ap.add_argument("--ckpt", default=os.path.join(OUT, "eiea_30b.pt"))
-    ap.add_argument("--out", default=os.path.join(OUT, "eval_eiea_30b.json"))
-    args = ap.parse_args()
-    rows = json.load(open(os.path.join(OUT, "val_cues.json")))[:args.limit]
-    sys.path.insert(0, PROJ); sys.path.insert(0, EIEA_DIR)
-    from transformers import AutoConfig, AutoProcessor
-    from qwen_vl_utils import process_vision_info
-    spec = importlib.util.spec_from_file_location(
-        "eiea_modeling", os.path.join(EIEA_DIR, "qwen3_vl_moe_vggt.py"))
-    mod = importlib.util.module_from_spec(spec); sys.modules["eiea_modeling"] = mod
-    spec.loader.exec_module(mod)
-    C = mod.Qwen3VLMoeVGGTForConditionalGeneration
+    args = parse_args()
+    if not torch.cuda.is_available():
+        raise RuntimeError("evaluation requires CUDA")
+    torch.cuda.set_device(torch.device(args.device))
+    random.seed(args.seed)
+    np.random.seed(args.seed)
 
-    cfg = AutoConfig.from_pretrained(MODEL_DIR, trust_remote_code=True)
-    n = cfg.text_config.num_hidden_layers
-    dm = {f"model.language_model.layers.{i}": (0 if i < 22 else 1) for i in range(n)}
-    dm.update({"model.language_model.embed_tokens": 0, "model.language_model.norm": 1,
-               "model.language_model.rotary_emb": 0, "model.visual": 0,
-               "spatial_encoder": 0, "connector": 0, "lm_head": 1})
-    cfg.vggt_device = "cuda:0"; cfg.vggt_dtype = "bfloat16"
-    model = C.from_pretrained(MODEL_DIR, config=cfg, dtype=torch.bfloat16,
-                              device_map=dm, trust_remote_code=True)
+    from model.eiea.ssr_eiea_common import load_midi, load_visual_encoders
+    from training.train_eiea_30b import load_eiea_vlm
+
+    rows = load_rows(args.data, limit=args.limit)
+    conditions = args.conditions or (EVAL_CONDITIONS + ["wrong_scene", "no_cue"])
+    print(f"{len(rows)} rows; conditions={conditions}", flush=True)
+
+    model, proc, tps, d_vlm = load_eiea_vlm(args.model_dir, args.gpu_layers)
     model.eval()
-    proc = AutoProcessor.from_pretrained(MODEL_DIR, trust_remote_code=True)
-    # match the 512-image-token budget used in the cost benchmarks
-    try:
-        proc.image_processor.max_pixels = 512 * 16 * 16 * 4
-        proc.image_processor.min_pixels = 4 * 16 * 16 * 4
-    except Exception as e:
-        print("pixel cap not set:", e, flush=True)
-    tps = int(cfg.vision_config.temporal_patch_size)
-    tok = proc.tokenizer
-    spec2 = importlib.util.spec_from_file_location(
-        "xreg3da", PROJ + "/plugin/qwen3_vl_moe_vggt_register.py")
-    reg = importlib.util.module_from_spec(spec2); sys.modules["xreg3da"] = reg
-    spec2.loader.exec_module(reg)
-    prep = reg._preprocess_image_to_vggt_tensor
+    model.config.use_cache = True
+    cap_processor_pixels(proc, args.max_image_tokens)
 
-    ck = torch.load(args.ckpt, map_location="cpu")
-    midi, mtok = load_midi("cuda:1"); midi.load_state_dict(ck["midi"])
-    encoder = E2EEncoder(midi, use_boxes=True, use_bev=False).to("cuda:1")
-    encoder.load_state_dict({"midi": ck["midi"], **ck["enc"]}, strict=False)
-    encoder.eval()
-    proj = nn.Linear(3584, 2048).to("cuda:1")
-    proj.load_state_dict(ck["proj"]); proj.eval()
-    cp, clip, sp, sig = load_visual_encoders("cuda:1")
-    tor_mtok = mtok.convert_tokens_to_ids(TOR)
+    midi, mtok = load_midi(args.device)
+    encoder, ck = EIEACueEncoder.from_checkpoint(
+        args.ckpt, midi.mamba, map_location="cpu")
+    encoder = encoder.to(args.device).eval()
+    clip_proc, clip, sig_proc, sig = load_visual_encoders(args.device)
+    if encoder.cfg.d_vlm != d_vlm:
+        raise ValueError(
+            f"checkpoint d_vlm={encoder.cfg.d_vlm} does not match model d_vlm={d_vlm}")
 
-    def cue_for(r, boxes):
-        img = Image.open(r["images"][1]).convert("RGB"); dep = np.load(r["depth"])
+    rng = random.Random(args.seed)
+
+    def cue_for(row, boxes, bev, depth):
+        img = load_view_images(row, 1)[0]
         with torch.no_grad():
-            ie = clip(**cp(images=img, return_tensors="pt").to("cuda:1")).last_hidden_state.float()
-            de = sig(**sp(images=dep, return_tensors="pt").to("cuda:1")).last_hidden_state.float()
-            ids = mtok(r["question"] + insert_tor("", 10), add_special_tokens=False, return_tensors="pt")
-            bt = torch.tensor(boxes, dtype=torch.float32, device="cuda:1") if boxes else torch.zeros(0, 11, device="cuda:1")
-            c = encoder(ie, de, bt, None, ids.input_ids.to("cuda:1"), tor_mtok)
-            c = proj(c.float()).unsqueeze(0).to(torch.bfloat16)
-        return c
+            ie = clip(**clip_proc(images=img, return_tensors="pt").to(args.device)).last_hidden_state.float()
+            de = None
+            if depth is not None:
+                de = sig(**sig_proc(images=depth, return_tensors="pt").to(args.device)).last_hidden_state.float()
+            ids = mamba_text_ids(mtok, row).to(args.device)
+            bt = torch.from_numpy(boxes).to(args.device)
+            bv = None if bev is None else torch.from_numpy(bev).to(args.device)
+            c = encoder(ie, de, bt, bv, None, ids)
+        return c.to(torch.bfloat16)
 
-    def generate(r, cue, mt, timing=None):
-        text = (TOR_STR * 10 if cue is not None else "") + "\n" + r["question"] + TERSE
-        img = Image.open(r["images"][1]).convert("RGB")
-        msgs = [{"role": "user", "content": [{"type": "image", "image": img},
-                                             {"type": "text", "text": text}]}]
-        prompt = proc.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
-        imgs, _ = process_vision_info(msgs)
-        enc = proc(text=[prompt], images=[img], return_tensors="pt")
-        kw = {k: v.to("cuda:0") for k, v in enc.items()
-              if k in ("input_ids", "attention_mask", "pixel_values", "image_grid_thw")}
-        tchw = torch.stack([prep(img)] * (int(enc["image_grid_thw"][0, 0]) * tps), 0).to("cuda:0")
-        torch.cuda.synchronize(); t0 = time.perf_counter()
+    def generate(row, cue, with_tor: bool):
+        kw = prepare_vlm_batch(
+            proc, row, torch.device(args.device), n_views=args.n_views,
+            tor_str=args.tor_str, num_tor=encoder.cfg.num_tor,
+            answer=None, with_tor=with_tor)
+        tchw = make_image_tchw(kw["images"], tps).to(args.device)
+        model_kwargs = {k: v for k, v in kw.items()
+                        if k in ("input_ids", "attention_mask", "pixel_values",
+                                 "image_grid_thw")}
+        gen_kw = dict(max_new_tokens=args.max_new_tokens, do_sample=False,
+                      stop_strings=["</answer>"], tokenizer=proc.tokenizer)
         with torch.no_grad():
-            if cue is not None:
-                o = model.generate(**kw, image_tchw=[tchw], max_new_tokens=mt,
-                                   do_sample=False, stop_strings=["</answer>"],
-                                   tokenizer=tok, tor_embeds=cue, tor_token_id=TOR_ID)
+            if cue is not None and with_tor:
+                out = model.generate(**model_kwargs, image_tchw=[tchw],
+                                     tor_embeds=cue,
+                                     tor_token_id=kw["tor_token_id"], **gen_kw)
             else:
-                o = model.generate(**kw, image_tchw=[tchw], max_new_tokens=mt,
-                                   do_sample=False, stop_strings=["</answer>"], tokenizer=tok)
-        torch.cuda.synchronize()
-        return time.perf_counter() - t0, o, kw
+                out = model.generate(**model_kwargs, image_tchw=[tchw], **gen_kw)
+        raw = proc.tokenizer.decode(out[0][kw["input_ids"].shape[1]:],
+                                    skip_special_tokens=True)
+        return extract_answer(raw), raw
 
-    res = {c: [] for c in CONDS}
-    rec = []
-    for i, r in enumerate(rows):
-        variants = {"clean": r["boxes"], "no_boxes": [],
-                    "wrong_scene": rows[(i + 1) % len(rows)]["boxes"]}
-        for c, bx in variants.items():
-            cue = cue_for(r, bx)
-            _, o, kw = generate(r, cue, 32)
-            raw = tok.decode(o[0][kw["input_ids"].shape[1]:], skip_special_tokens=True)
-            m = re.search(r"<answer>\s*(.*?)\s*</answer>", raw, re.I | re.S)
-            pred = (m.group(1) if m else raw).strip()
-            res[c].append({"qid": f"q{i}", "gt": r["answer"], "pred": pred,
-                           "ok": score(pred, r["answer"]), "n_tok": int(kw["input_ids"].shape[1])})
-            if c == "clean":
-                tp, _, _ = generate(r, cue, 1)
-                tt, _, _ = generate(r, cue, 32)
-                rec.append({"prompt_tokens": int(kw["input_ids"].shape[1]),
-                            "prefill": tp, "total": tt, "decode": tt - tp})
-        _, o, kw = generate(r, None, 32)
-        raw = tok.decode(o[0][kw["input_ids"].shape[1]:], skip_special_tokens=True)
-        m = re.search(r"<answer>\s*(.*?)\s*</answer>", raw, re.I | re.S)
-        pred = (m.group(1) if m else raw).strip()
-        res["no_cue"].append({"qid": f"q{i}", "gt": r["answer"], "pred": pred,
-                              "ok": score(pred, r["answer"])})
+    results: Dict[str, List[Dict[str, Any]]] = {c: [] for c in conditions}
+    for i, row in enumerate(rows):
+        boxes = boxes_from_row(row)
+        bev = load_bev(row, args.bev_channels)
+        depth = load_depth(row)
+        # donor for the cross-scene condition
+        donor = rows[(i + 1) % len(rows)]
+        for cond in conditions:
+            if cond == "no_cue":
+                pred, raw = generate(row, None, with_tor=False)
+            elif cond == "wrong_scene":
+                c = cue_for(row, boxes_from_row(donor),
+                            load_bev(donor, args.bev_channels),
+                            load_depth(donor))
+                pred, raw = generate(row, c, with_tor=True)
+            else:
+                corr = apply_eval_condition(
+                    cond, boxes, bev, depth,
+                    rng=random.Random(args.seed * 100003 + i))
+                c = cue_for(row, corr.boxes, corr.bev, corr.depth)
+                pred, raw = generate(row, c, with_tor=True)
+            results[cond].append({
+                "qid": str(row.get("qid", i)),
+                "gt": row.get("answer"),
+                "pred": pred,
+                "raw": raw,
+                "score": score_answer(pred, row.get("answer")),
+            })
         if (i + 1) % 10 == 0:
-            print(i + 1, "/", len(rows), flush=True)
+            print(f"{i + 1}/{len(rows)}", flush=True)
 
-    summary = {}
-    for c, recs in res.items():
-        mc = [x for x in recs if not _num(x["gt"])]
-        vals = []
-        for x in recs:
-            if _num(x["gt"]):
-                nums = re.findall(r"-?\d+(?:\.\d+)?", x["pred"])
-                if nums:
-                    vals.append(abs(float(nums[0]) - float(x["gt"])))
-        summary[c] = {"n": len(recs), "mc_n": len(mc),
-                      "mc_acc": statistics.mean(x["ok"] for x in mc) if mc else None,
-                      "num_n": len(vals),
-                      "num_mae": statistics.mean(vals) if vals else None}
-    summary["cost"] = {f: statistics.mean(x[f] for x in rec) for f in
-                       ["prompt_tokens", "prefill", "decode", "total"]}
-    print(json.dumps(summary, indent=1))
-    json.dump({"summary": summary, "predictions": res},
-              open(args.out, "w"), indent=1, ensure_ascii=False)
+    summary = {c: mc_summary(recs) for c, recs in results.items()}
+    deltas = {c: paired_delta(results, c) for c in conditions if c != "clean"}
+    clean_pred = {r["qid"]: r["pred"] for r in results.get("clean", [])}
+    nocue_pred = {r["qid"]: r["pred"] for r in results.get("no_cue", [])}
+    cue_used = any(clean_pred.get(q) != nocue_pred.get(q) for q in clean_pred)
+    if not cue_used:
+        print("WARNING: clean and no_cue produced identical predictions on all "
+              "questions; the cue may not be injected. Check TOR count / shapes.",
+              flush=True)
 
-
-def _num(x):
-    try:
-        float(x); return True
-    except ValueError:
-        return False
+    out = {"summary": summary, "deltas_vs_clean": deltas,
+           "cue_changes_output": cue_used,
+           "checkpoint": args.ckpt, "data": args.data,
+           "predictions": results}
+    os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
+    json.dump(out, open(args.out, "w"), indent=1, ensure_ascii=False)
+    with open(os.path.splitext(args.out)[0] + ".jsonl", "w") as f:
+        for cond, recs in results.items():
+            for r in recs:
+                f.write(json.dumps({"condition": cond, "qid": r["qid"],
+                                    "gt": r["gt"], "pred": r["pred"],
+                                    "score": r["score"]}) + "\n")
+    print(json.dumps({"summary": summary, "deltas": deltas,
+                      "cue_changes_output": cue_used}, indent=1))
+    print(f"saved {args.out}", flush=True)
 
 
 if __name__ == "__main__":

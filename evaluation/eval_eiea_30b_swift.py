@@ -10,11 +10,13 @@ import time
 
 import torch
 
-sys.path.insert(0, "/home/kaneqian/XEmbodied/code/xembodied-code - AAAI/xembodied/EIEA/models")
-OUT = "/home/kaneqian/XEmbodied/results/eiea_box"
-CUE_DIR = "/tmp/eiea_cues"
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
+OUT = os.environ.get("EIEABOX_OUT", os.path.join(ROOT, "results", "eiea_box"))
+CUE_DIR = os.environ.get("EIEABOX_CUE_DIR", "/tmp/eiea_cues")
 CUR = "/tmp/eiea_cue_current.pt"
-REG = "/tmp/eiea_register_swift.py"
+REG = os.path.join(ROOT, "model", "eiea", "qwen3_vl_vggt_register.py")
 TOR_STR = "<|endoftext|>"
 
 
@@ -57,15 +59,11 @@ def main():
     ap.add_argument("--n_images", type=int, default=1)
     ap.add_argument("--timing", action="store_true")
     args = ap.parse_args()
-    # register with the mutable cache path
-    src = ("/home/kaneqian/XEmbodied/code/xembodied-code - AAAI/xembodied/EIEA/models/"
-           "qwen3_vl_vggt_register.py")
-    s = open(src).read()
-    s = s.replace('TOR_EMBEDS_PATH = os.path.join(os.path.dirname(__file__), "tor_embeds_cache_fb.pt")',
-                  f'TOR_EMBEDS_PATH = "{CUR}"')
-    s = s.replace('_DEFAULT_VGGT_REPO_DIR = str(Path(__file__).resolve().parents[3] / "vggt")',
-                  '_DEFAULT_VGGT_REPO_DIR = "/home/kaneqian/XEmbodied/code/xembodied-code - AAAI/xembodied/3DA/my_qwen3_vggt_xattnv2/vggt"')
-    open(REG, "w").write(s)
+    # The register reads XEMB_TOR_CACHE at generate time; copy each sample's
+    # cue to CUR and point the env at it.  VGGT resolves to the in-repo
+    # model/3da copy, so no source patching is needed.
+    os.environ["XEMB_TOR_CACHE"] = CUR
+    os.environ.setdefault("VGGT_REPO_DIR", os.path.join(ROOT, "model", "3da"))
 
     from swift.utils import import_external_file
     from swift.infer_engine import TransformersEngine, InferRequest, RequestConfig

@@ -1,64 +1,139 @@
 # EIEA Architecture: Forward Pass and Design Clarifications
 
-This document clarifies the EIEA (Efficient Image-Embodied Adapter) forward pass, addressing reviewer questions about Mamba input ordering, token count, and dimensional consistency.
+This document specifies the public EIEA (Efficient Image-Embodied Adapter)
+forward pass and records the points where the paper, the technical supplement
+and the rebuttal need to be read together. The executable reference is
+[`model/eiea/cue_encoder.py`](../model/eiea/cue_encoder.py).
 
 ## Mamba-2 Input Sequence
 
-The Mamba-2 interpreter processes the following sequence in a single causal scan:
+The Mamba-2 interpreter performs one causal scan over
 
 ```
-[image_proj(IE); depth_proj(DE); box_tokens(BX); bev_tokens(BV); TOR_queries(Q); text_ids(T)]
+[X_T; X_img; X_depth; <PHY>; Z_box; <MOD>; Z_BEVmap; (<MOD>; Z_BEVflow); R_1 ... R_K]
 ```
 
 | Segment | Source | Shape | Description |
 |---------|--------|-------|-------------|
-| `IE` | CLIP ViT-L last hidden states | `[1, N_img, 1024]` | Front-view image features |
-| `DE` | SigLIP-SO400M last hidden states | `[1, N_dep, 1152]` | Depth map features (DepthPro) |
-| `BX` | Box encoder output | `[1, N_box, 768]` | 3D box tokens (class emb + geometric params → MLP) |
-| `BV` | BEV encoder output | `[1, 64, 768]` | BEV grid tokens (CNN → 8×8 spatial pool → Linear) |
-| `Q` | Learnable TOR queries | `[1, 10, 768]` | 10 latent reasoning tokens |
-| `T` | Token embeddings | `[1, L_text, 768]` | Question token IDs via Mamba embedding table |
+| `X_T` | question tokenizer + Mamba embedding | `[1, L_text, 768]` | Question/options text |
+| `X_img` | CLIP ViT-L last hidden states → `image_proj` | `[1, N_img, 768]` | Front-view image features |
+| `X_depth` | SigLIP-SO400M last hidden states → `depth_proj` | `[1, N_dep, 768]` | DepthPro depth features |
+| `<PHY>` | learnable marker | `[1, 768]` | Starts the physical-cue block |
+| `Z_box` | `BoxEncoder` | `[N_box, 768]` | Class embedding + 10 geometric/kinematic features → MLP |
+| `<MOD>` | learnable separator | `[1, 768]` | Separates heterogeneous physical modalities |
+| `Z_BEVmap` | `BEVEncoder` | `[64, 768]` | BEV raster → CNN → 8×8 spatial pool → Linear |
+| `Z_BEVflow` | `FlowEncoder` (optional) | `[64, 768]` | BEV-flow raster (paper's PriorMotion modality) |
+| `R_1..R_K` | learnable latent queries | `[K, 768]` | `K = 10` in the public implementation |
 
-All segments are projected to `d_mamba = 768` before concatenation. The full sequence length is `N_img + N_dep + N_box + 64 + L_text`.
+`<PHY>`/`<MOD>` are the paper supplement's symbolic markers; they are inserted
+only around physical cues that are actually present, so a missing modality
+simply removes its separator as well. Set `EIEAConfig.use_modality_tokens =
+False` to reproduce the simpler `[X_T; X_img; X_depth; Z_box; Z_BEVmap; R]`
+sequence used by the early SSR-MIDI prototype.
+
+All segments are projected to `d_mamba = 768` before concatenation. The
+supplement's design table says `d = 1024`, but the released SSR-MIDI checkpoint
+is built on `mamba-130m`, whose native hidden size is 768; the public code uses
+768 so the pretrained MIDI weights load without re-shaping. Missing cues are
+represented by omitting their tokens; this is the same state the model sees when
+the training-time random masking in
+[`model/eiea/corruption.py`](../model/eiea/corruption.py) removes a modality.
+
+### Ordering
+
+The paper supplement writes the interpreter input as
+`[X_T; <PHY>; Z_BEVmap; <MOD>; Z_BEVflow; <MOD>; Z_3Dbox]` (text first,
+physical cues after it). The rebuttal Q&A writes
+`[X_T; <PHY>; Z_map; <MOD>; Z_flow; <MOD>; Z_box; R_1..R_10]` and explains that
+the ten latent tokens are **last** so their causal state has already seen the
+whole question and all physical blocks. The public implementation follows the
+rebuttal ordering. The earlier version of this document placed the latent
+queries *before* the question text; that is inconsistent with a causal
+interpreter and has been corrected.
 
 ## Retained Positions
 
-Only the hidden states at the 10 TOR query positions are extracted:
+Only the hidden states at the `K` latent-query positions are retained:
 
-```
-tor_start = N_img + N_dep + N_box
-tor_end   = tor_start + 10
-tor_hidden = hidden_states[:, tor_start:tor_end, :]
+```python
+tor_hidden = hidden_states[:, -K:, :]          # queries are appended last
 ```
 
-These 10 positions are placed **after** all image/depth/box tokens and **before** the question text, so their causal states have already aggregated all physical-cue evidence. No bidirectional scan is needed.
+Extracting by offset (`N_img + N_dep + N_box + ...`) is brittle because the
+box/BEV/flow token counts vary with the sample and with missing modalities;
+the implementation therefore takes the last `K` positions by construction.
 
 ## Projection to VLM Space
 
-The TOR hidden states (d_mamba = 768) are projected to d_VLM via:
-
-```
-Z_phy = Linear(GELU(Linear(RMSNorm(tor_hidden))))   # [10, d_VLM]
+```python
+Z_phy = Linear(GELU(Linear(RMSNorm(tor_hidden))))   # [K, d_VLM]
 ```
 
-For the 30B model, `d_VLM = 2048` (matching Qwen3-VL-30B-A3B's hidden size). The `10 × 3584` cache in the released code is from an earlier Qwen2.5-VL-7B prototype (7B hidden size = 3584).
+For the 30B model, `d_VLM = 2048` (Qwen3-VL-30B-A3B word-embedding size). For
+the 7B SSR proxy (rebuttal EIEA-lite), `d_VLM = 3584`.
 
 ## TOR Token Injection
 
-The 10 projected cue tokens are injected into the frozen VLM's input embeddings:
+The `K` projected cue tokens replace the embeddings of `K` designated
+placeholder tokens in the frozen VLM's prompt:
 
 ```python
-mask = input_ids == tor_token_id
+mask = input_ids == tor_token_id          # or an explicit tor_positions mask
 inputs_embeds = inputs_embeds.masked_scatter(
-    mask.unsqueeze(-1).expand_as(inputs_embeds), tor_embeds)
+    mask.unsqueeze(-1).expand_as(inputs_embeds), tor_embeds.reshape(-1, d_vlm))
 ```
 
-This is equivalent to replacing the embedding of 10 designated `<TOR>` tokens with the cue representations. The VLM backbone is frozen; only the cue encoder is trained.
+The public 30B path uses `tor_token_id = 151643` (`<|endoftext|>`) as the
+placeholder, exactly `K` times in the prompt. The model now **raises** if the
+marker count does not equal the cue length, instead of silently skipping the
+injection. During decoding there are no prompt positions left, so injection
+is intentionally skipped.
 
-## Token Count Clarification
+The prompt builder places the `K` placeholders immediately before the question
+(`<TOR>...<TOR>\n<question>`), matching the rebuttal's evaluation scripts. The
+paper schematic draws `<PHY>` after `<TEXT>`; because the VLM is a decoder, both
+orders expose the cue to the question, and the public/rebuttal implementation is
+the one used here.
 
-The paper and code use **10 latent reasoning tokens**, not 64. The "64" in the supplementary material is a typographical error (the supplementary text also states "insert 10 latent reasoning tokens").
+## Missing / Partial Cues
 
-## Dimensional Clarification
+EIEA is trained with random modality masking and noise (see
+[`docs/EIEA_TRAINING.md`](EIEA_TRAINING.md)):
 
-The `(1, 10, 3584)` demo cache in the released code is from the early Qwen2.5-VL-7B prototype. The 7B hidden size is 3584, hence the cache dimension. The released 30B model uses d_VLM = 2048, and the cue encoder output is projected accordingly. The `(1, 10, 3584)` cache is **not** the final EIEA output format.
+- whole-modality drop of box, BEV or depth;
+- partial-cue curriculum keeping only one of the three;
+- per-box element drop and geometric jitter;
+- BEV block masking, Gaussian noise and channel drop;
+- depth Gaussian noise, block masking and flattening.
+
+At inference the same interventions are applied to produce the stress-test
+conditions `no_box`, `drop50_box`, `jitter_box`, `no_bev`, `bev_mask50`,
+`bev_noise`, `no_depth`, `depth_noise`, `depth_mask`, `no_physical`,
+`box_only`, `bev_only`, `depth_only`, `wrong_scene` and `no_cue`.
+
+## Dimension / Count Clarifications
+
+The public checkpoint and rebuttal use **`K = 10`** latent cue tokens and
+`d_VLM = 2048` for Qwen3-VL-30B-A3B. The technical supplement's
+`L_compact = 64` and `d_VLM = 8192` describe an earlier configuration and do
+not match the released 30B word-embedding size; they should not be used to
+size the public model. `docs/EIEA_ARCHITECTURE.md` previously called the 64 a
+typographical error; the safer statement is that 10/2048 is what the public
+code, the rebuttal experiments and the 30B checkpoint actually use.
+
+The supplement specifies a capacity of `L_3D = 100` box tokens per scene. The
+public data builder emits at most 30 boxes per frame (all annotations within
+50 m), and `BoxEncoder.max_boxes` defaults to 100 to enforce the paper's cap
+without padding short scenes with fake boxes.
+
+## Modality Encoders
+
+The paper lists DiffMap (BEV map, 768-d), PriorMotion (BEV flow, 512-d) and
+SG-Net (3D box, 256-d) as the modality encoders. Those pretrained encoders are
+not part of the public release. This repository ships lightweight stand-ins
+(CNN for map/flow, MLP for boxes) with the same token interface and shape, so
+the interpreter / projection / injection path is paper-faithful while the
+encoder weights can be swapped in later. The public training recipe uses
+box + BEV map + depth, matching the data fields that are actually shipped; the
+paper's BEV-flow modality is available through `FlowEncoder` when flow rasters
+are supplied.
